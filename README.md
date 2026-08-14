@@ -10,8 +10,8 @@ You pick a marketplace ISO code and one All-menu path: `Department -> Subcategor
 | --- | --- |
 | `marketplace` | ISO country code (`IN`, `US`, `GB`, `DE`, …). `UK` is accepted as an alias for `GB`. |
 | `category` | One path from the All menu, e.g. `Mobiles, Computers -> All Mobile Phones`. Use `Department -> (All)` for the whole department. |
-| `maxPages` or `pages` | Optional. How many listing pages to fetch. `0` or omit = no page limit (stop when Amazon has no new products, or at `maxItems`). |
-| `maxItems` | Default `5000`. |
+| `maxPages` or `pages` | Optional. How many listing pages to fetch. `0` or omit = no page limit. |
+| `maxItems` | Optional. `0` or omit = no item limit. |
 | `enrichDetails` | Default `true`. Fetch brand / About this item from each `/dp/ASIN` page. |
 | `maxConcurrency` | Default `50`. Worker pool size. Each worker keeps a sticky residential IP and rotates it after ~25 product pages or on a block. |
 | `proxyConfiguration` | Apify proxy. Residential is recommended. |

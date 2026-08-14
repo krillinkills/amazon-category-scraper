@@ -77,7 +77,7 @@ def main() -> None:
                 'type': 'integer',
                 'description': (
                     'How many Amazon listing pages to fetch. 0 or empty means no page limit: '
-                    'keep going until Amazon returns no new products or maxItems is reached.'
+                    'keep going until Amazon returns no new products.'
                 ),
                 'minimum': 0,
                 'default': 0,
@@ -86,10 +86,12 @@ def main() -> None:
             'maxItems': {
                 'title': 'Max items',
                 'type': 'integer',
-                'description': 'Stop after this many product cards.',
-                'minimum': 1,
-                'maximum': 10000,
-                'default': 5000,
+                'description': (
+                    'Stop after this many product cards. 0 or empty means no item limit: '
+                    'keep going until listing pages run out.'
+                ),
+                'minimum': 0,
+                'default': 0,
             },
             'enrichDetails': {
                 'title': 'Fetch product details',

@@ -19,16 +19,20 @@ from .scraper import (
 from .sticky import LISTING_REQUESTS_PER_IP, MAX_REQUESTS_PER_IP, StickyProxySession
 
 
-def _parse_max_pages(pages_input: Any) -> int | None:
-    if pages_input is None or pages_input == '':
+def _parse_optional_limit(value: Any, *, field: str) -> int | None:
+    if value is None or value == '':
         return None
     try:
-        value = int(pages_input)
+        parsed = int(value)
     except (TypeError, ValueError) as error:
-        raise ValueError('pages / maxPages must be an integer. Use 0 for no limit.') from error
-    if value <= 0:
+        raise ValueError(f'{field} must be an integer. Use 0 for no limit.') from error
+    if parsed <= 0:
         return None
-    return value
+    return parsed
+
+
+def _reached_limit(count: int, limit: int | None) -> bool:
+    return limit is not None and count >= limit
 
 
 async def _enrich_item(
@@ -57,7 +61,8 @@ async def main() -> None:
         department = actor_input.get('department')
         subcategory = actor_input.get('subcategory')
         pages_input = actor_input.get('pages', actor_input.get('maxPages'))
-        max_items = int(actor_input.get('maxItems') or 5000)
+        max_pages = _parse_optional_limit(pages_input, field='pages / maxPages')
+        max_items = _parse_optional_limit(actor_input.get('maxItems'), field='maxItems')
         enrich_details = actor_input.get('enrichDetails', True)
         if isinstance(enrich_details, str):
             enrich_details = enrich_details.strip().lower() not in {'0', 'false', 'no'}
@@ -67,7 +72,6 @@ async def main() -> None:
             raise ValueError('marketplace is required.')
         if not category and not (department and subcategory):
             raise ValueError('category is required, e.g. "Mobiles, Computers -> All Mobile Phones".')
-        max_pages = _parse_max_pages(pages_input)
 
         try:
             resolved = resolve_category_input(
@@ -99,10 +103,11 @@ async def main() -> None:
         }
 
         pages_label = 'unlimited pages' if max_pages is None else f'max {max_pages} pages'
+        items_label = 'unlimited items' if max_items is None else f'{max_items} items'
         Actor.log.info(
             f'Scraping {resolved.marketplace} {resolved.category_path} '
             f'on {resolved.domain} node={resolved.browse_node_id} '
-            f'({pages_label}, {max_items} items, '
+            f'({pages_label}, {items_label}, '
             f'details={"on" if enrich_details else "off"}, concurrency={concurrency}, '
             f'sticky IPs rotate every {MAX_REQUESTS_PER_IP} product pages)'
         )
@@ -112,7 +117,7 @@ async def main() -> None:
         )
         listing_headers = request_headers()
         detail_headers = request_headers(resolved.marketplace)
-        worker_count = min(concurrency, max_items) if enrich_details else 0
+        worker_count = concurrency if enrich_details else 0
 
         listing = StickyProxySession(
             proxy_configuration,
@@ -198,7 +203,7 @@ async def main() -> None:
 
         try:
             page = 0
-            while queued < max_items:
+            while not _reached_limit(queued, max_items):
                 if max_pages is not None and page >= max_pages:
                     break
                 page += 1
@@ -230,7 +235,7 @@ async def main() -> None:
 
                 page_added = 0
                 for position, card in enumerate(cards, start=1):
-                    if queued >= max_items:
+                    if _reached_limit(queued, max_items):
                         break
                     asin = card['asin']
                     if asin in seen:
@@ -265,7 +270,7 @@ async def main() -> None:
                     Actor.log.info(f'Page {page} had no new ASINs, stopping.')
                     break
                 more_pages = max_pages is None or page < max_pages
-                if more_pages and queued < max_items:
+                if more_pages and not _reached_limit(queued, max_items):
                     await polite_pause()
         finally:
             for _ in workers:
