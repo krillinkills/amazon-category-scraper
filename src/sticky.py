@@ -27,9 +27,7 @@ IMPERSONATE_POOL = (
     'chrome131',
     'chrome136',
     'chrome146',
-    'chrome131_android',
     'safari184',
-    'safari184_ios',
     'edge101',
 )
 DEFAULT_IMPERSONATE = 'chrome'
@@ -78,13 +76,18 @@ class StickyProxySession:
         if reason != 'start':
             Actor.log.info(f'Rotated sticky IP {self.name} -> {self.session_id} ({reason})')
 
-    async def fetch(self, url: str, headers: dict[str, str]) -> str:
+    async def fetch(
+        self,
+        url: str,
+        headers: dict[str, str],
+        **fetch_kwargs: Any,
+    ) -> str:
         if self.http is None:
             await self.start()
         if self.requests_on_ip >= self.max_requests:
             await self.rotate(f'proactive after {self.requests_on_ip} requests')
         assert self.http is not None
-        html = await fetch_html(url, session=self.http, headers=headers)
+        html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
         self.requests_on_ip += 1
         return html
 
@@ -94,11 +97,12 @@ class StickyProxySession:
         headers: dict[str, str],
         *,
         attempts: int = 3,
+        **fetch_kwargs: Any,
     ) -> tuple[str | None, Exception | None]:
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return await self.fetch(url, headers), None
+                return await self.fetch(url, headers, **fetch_kwargs), None
             except (AmazonBlockedError, AmazonRetryableError, Exception) as error:
                 last_error = error
                 Actor.log.warning(

@@ -9,9 +9,11 @@ from apify import Actor
 from .category_tree import CategoryLookupError, listing_url, resolve_category_input
 from .scraper import (
     EMPTY_PRODUCT_DETAILS,
+    PDP_CUT_MARKERS,
+    PDP_KEEP_MARKERS,
     AmazonBlockedError,
     AmazonRetryableError,
-    has_product_details,
+    has_core_details,
     parse_listing_cards,
     parse_product_detail,
     polite_pause,
@@ -151,19 +153,27 @@ async def _enrich_item(
     sticky: StickyProxySession,
     domain: str,
     headers: dict[str, str],
+    attempts: int = 2,
+    abort_after_product_block: bool = True,
 ) -> dict[str, Any] | None:
     url = product_fetch_url(domain, item['asin'])
     last_error: Exception | None = None
-    for attempt in range(1, 4):
+    abort_kwargs: dict[str, Any] = {}
+    if abort_after_product_block:
+        abort_kwargs = {
+            'abort_after': PDP_CUT_MARKERS,
+            'abort_requires': PDP_KEEP_MARKERS,
+        }
+    for attempt in range(1, attempts + 1):
         try:
-            html = await sticky.fetch(url, headers)
+            html = await sticky.fetch(url, headers, **abort_kwargs)
         except (AmazonBlockedError, AmazonRetryableError, Exception) as error:
             last_error = error
             Actor.log.warning(
-                f'{sticky.name} attempt {attempt}/3 failed for {url}: {error}'
+                f'{sticky.name} attempt {attempt}/{attempts} failed for {url}: {error}'
             )
             await sticky.rotate(f'{type(error).__name__} on attempt {attempt}')
-            if attempt < 3:
+            if attempt < attempts:
                 if isinstance(error, AmazonBlockedError):
                     await polite_pause(0.6, 1.4)
                 else:
@@ -175,18 +185,18 @@ async def _enrich_item(
             Actor.log.info(f'First PDP {item["asin"]}: {len(html)} chars downloaded')
 
         details = await asyncio.to_thread(parse_product_detail, html)
-        if has_product_details(details):
+        if has_core_details(details):
             return {**item, **details}
 
         last_error = AmazonRetryableError('empty product detail page')
         Actor.log.warning(
-            f'{sticky.name} attempt {attempt}/3 got no brand/details for {item["asin"]}'
+            f'{sticky.name} attempt {attempt}/{attempts} got no brand/overview for {item["asin"]}'
         )
         await sticky.rotate('empty product detail page')
-        if attempt < 3:
+        if attempt < attempts:
             await polite_pause(0.15, 0.5)
 
-    Actor.log.warning(f'Detail page failed for {item["asin"]}: {last_error}')
+    Actor.log.warning(f'Detail page incomplete for {item["asin"]}: {last_error}')
     return None
 
 
@@ -198,17 +208,20 @@ async def _enrich_all(
     headers: dict[str, str],
     concurrency: int,
 ) -> tuple[int, int]:
-    """Open product pages for every listing card. Returns (stored, skipped)."""
+    """Open product pages. Store only rows with brand, bullets, or overview."""
     if not items:
         return 0, 0
 
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     start_gate = asyncio.Semaphore(25)
+    retry_lock = asyncio.Lock()
+    retries: list[dict[str, Any]] = []
     pushed = 0
-    detail_fail = 0
+    missed = 0
+    pass_name = 'pass1'
 
     async def worker(index: int) -> None:
-        nonlocal pushed, detail_fail
+        nonlocal pushed, missed
         sticky = StickyProxySession(
             proxy_configuration,
             name=f'pdp{index}',
@@ -223,32 +236,42 @@ async def _enrich_all(
                     if sticky.http is None:
                         async with start_gate:
                             await sticky.start()
+                    attempts = 2 if pass_name == 'pass1' else 3
                     record = await _enrich_item(
                         payload,
                         sticky=sticky,
                         domain=domain,
                         headers=headers,
+                        attempts=attempts,
+                        abort_after_product_block=pass_name == 'pass1',
                     )
-                    if not record or not has_product_details(record):
-                        detail_fail += 1
-                        continue
-                    await Actor.push_data({
-                        **record,
-                        'hasDetails': True,
-                        'recordType': 'detail',
-                    })
-                    pushed += 1
-                    if pushed == 1:
-                        Actor.log.info(f'First detailed product written: {record.get("asin")}')
-                    if pushed % 25 == 0:
-                        Actor.log.info(
-                            f'Stored {pushed} detailed products ({detail_fail} skipped without details).'
-                        )
+                    if record and has_core_details(record):
+                        await Actor.push_data({
+                            **record,
+                            'hasDetails': True,
+                            'recordType': 'detail',
+                        })
+                        pushed += 1
+                        if pushed == 1:
+                            Actor.log.info(f'First detailed product written: {record.get("asin")}')
+                        if pushed % 25 == 0:
+                            Actor.log.info(
+                                f'Stored {pushed} detailed products ({missed} still missing details).'
+                            )
+                    elif pass_name == 'pass1':
+                        async with retry_lock:
+                            retries.append(payload)
+                    else:
+                        missed += 1
                 except Exception as error:
                     Actor.log.exception(
                         f'pdp{index} failed on {payload.get("asin") if payload else "?"}: {error}'
                     )
-                    detail_fail += 1
+                    if payload and pass_name == 'pass1':
+                        async with retry_lock:
+                            retries.append(payload)
+                    elif payload:
+                        missed += 1
                 finally:
                     queue.task_done()
         finally:
@@ -257,11 +280,25 @@ async def _enrich_all(
     workers = [asyncio.create_task(worker(index)) for index in range(concurrency)]
     Actor.log.info(
         f'{concurrency} detail workers starting on {len(items)} products '
-        f'(sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block).'
+        f'(sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
+        'Rows are stored only when brand, About this item, or overview parsed.'
     )
     try:
         for item in items:
             await queue.put(item)
+        await queue.join()
+
+        retry_batch = list(retries)
+        retries.clear()
+        if retry_batch:
+            pass_name = 'pass2'
+            Actor.log.info(
+                f'Retrying {len(retry_batch)} products that had no brand/overview.'
+            )
+            for item in retry_batch:
+                await queue.put(item)
+            await queue.join()
+
         for _ in workers:
             await queue.put(None)
         await asyncio.gather(*workers, return_exceptions=True)
@@ -270,7 +307,7 @@ async def _enrich_all(
             worker_task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         raise
-    return pushed, detail_fail
+    return pushed, missed
 
 
 async def main() -> None:
@@ -388,7 +425,8 @@ async def main() -> None:
             )
             detail_ok = pushed
             Actor.log.info(
-                f'Done. Stored {pushed} products ({detail_ok} stored, {detail_fail} skipped without details).'
+                f'Done. Stored {pushed} products with brand/overview '
+                f'({detail_fail} ASINs omitted after retries).'
             )
 
         await Actor.set_value('SCRAPE_META', {

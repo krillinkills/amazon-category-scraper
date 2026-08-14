@@ -8,7 +8,10 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 from curl_cffi import CurlOpt
+from curl_cffi.const import CurlECode
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 ROBOT_MARKERS = (
     'enter the characters you see below',
@@ -81,13 +84,26 @@ PDP_CUT_MARKERS = (
     'id="dpx-aplus-product-description_feature_div"',
     'id="reviewsMedley"',
     'id="customerReviews"',
-    'id="rhf"',
     'id="similarities_feature_div"',
     'id="purchase-similarities_feature_div"',
 )
 LISTING_CUT_MARKERS = (
-    'id="rhf"',
     'id="navFooter"',
+)
+
+# Only cut after these widgets. Do not use JSON-LD as the floor: it sits in
+# <head>, and an early #rhf / #aplus placeholder would drop the product body.
+PDP_KEEP_MARKERS = (
+    'id="feature-bullets"',
+    'id="featurebullets_feature_div"',
+    'id="productFactsDesktopExpander"',
+    'id="productFactsDesktop_feature_div"',
+    'id="productOverview_feature_div"',
+    'id="productDescription"',
+    'id="detailBullets_feature_div"',
+    'id="detailBulletsWrapper_feature_div"',
+    'id="bylineInfo"',
+    'id="wayfinding-breadcrumbs_feature_div"',
 )
 
 
@@ -97,6 +113,16 @@ def has_product_details(details: dict[str, Any]) -> bool:
         details.get('brand')
         or details.get('description')
         or details.get('productCategoryPath')
+        or details.get('productOverview')
+        or (isinstance(about, list) and about)
+    )
+
+
+def has_core_details(details: dict[str, Any]) -> bool:
+    """Brand, bullets, or overview — not breadcrumb-only JSON-LD."""
+    about = details.get('aboutThisItem')
+    return bool(
+        details.get('brand')
         or details.get('productOverview')
         or (isinstance(about, list) and about)
     )
@@ -165,19 +191,6 @@ def _strip_elements(html: str, tag: str, *, keep_if: str | None = None) -> str:
     return ''.join(parts)
 
 
-# Prefer to cut only after these product fields so a head/JSON-LD mention cannot
-# truncate the page before brand / bullets / description.
-PDP_KEEP_MARKERS = (
-    'id="feature-bullets"',
-    'id="featurebullets_feature_div"',
-    'id="productFactsDesktopExpander"',
-    'id="productOverview_feature_div"',
-    'id="productDescription"',
-    'id="wayfinding-breadcrumbs_feature_div"',
-    'application/ld+json',
-)
-
-
 def _cut_after_markers(
     html: str,
     markers: tuple[str, ...],
@@ -185,10 +198,14 @@ def _cut_after_markers(
     after: tuple[str, ...] = (),
 ) -> str:
     floor = 0
+    found_after = False
     for token in after:
         idx = html.find(token)
         if idx != -1:
+            found_after = True
             floor = max(floor, idx)
+    if after and not found_after:
+        return html
     cut_at: int | None = None
     for marker in markers:
         idx = html.find(marker)
@@ -216,6 +233,34 @@ def thin_listing_html(html: str) -> str:
     return _cut_after_markers(html, LISTING_CUT_MARKERS, after=('data-component-type="s-search-result"',))
 
 
+class _EarlyAbortBuffer:
+    """Collect HTML and tell curl to hang up once the product block is in."""
+
+    def __init__(self, cut: tuple[str, ...], require: tuple[str, ...]) -> None:
+        self.cut = cut
+        self.require = require
+        self.chunks: list[bytes] = []
+        self.aborted = False
+        self._found_keep = False
+        self._tail = ''
+        self._overlap = max(len(token) for token in cut + require)
+
+    def __call__(self, chunk: bytes) -> int:
+        self.chunks.append(chunk)
+        piece = chunk.decode('latin-1')
+        haystack = self._tail + piece
+        if not self._found_keep:
+            self._found_keep = any(token in haystack for token in self.require)
+        if self._found_keep and any(token in haystack for token in self.cut):
+            self.aborted = True
+            return CURL_WRITEFUNC_ERROR
+        self._tail = haystack[-self._overlap:]
+        return len(chunk)
+
+    def text(self) -> str:
+        return b''.join(self.chunks).decode('utf-8', errors='replace')
+
+
 def create_session(
     max_clients: int,
     proxy_url: str | None = None,
@@ -241,26 +286,48 @@ async def fetch_html(
     timeout: int = REQUEST_TIMEOUT,
     session: AsyncSession | None = None,
     headers: dict[str, str] | None = None,
+    *,
+    abort_after: tuple[str, ...] | None = None,
+    abort_requires: tuple[str, ...] | None = None,
 ) -> str:
     owns_session = session is None
     if session is None:
         session = create_session(max_clients=1, proxy_url=proxy_url)
+    abort_buf = (
+        _EarlyAbortBuffer(abort_after, abort_requires)
+        if abort_after and abort_requires
+        else None
+    )
     try:
+        status = 0
+        html = ''
         try:
             response = await session.get(
                 url,
                 headers=headers or DEFAULT_HEADERS,
                 timeout=timeout,
                 allow_redirects=True,
+                content_callback=abort_buf,
             )
+            status = response.status_code
+            html = abort_buf.text() if abort_buf is not None else (response.text or '')
+        except RequestException as error:
+            aborted = (
+                abort_buf is not None
+                and abort_buf.aborted
+                and error.code == CurlECode.WRITE_ERROR
+            )
+            if not aborted:
+                raise AmazonRetryableError(f'Request failed for {url}: {error}') from error
+            status = error.response.status_code if error.response is not None else 200
+            html = abort_buf.text()
         except Exception as error:
             raise AmazonRetryableError(f'Request failed for {url}: {error}') from error
 
-        if response.status_code in {429, 500, 502, 503, 504}:
-            raise AmazonRetryableError(f'HTTP {response.status_code} on {url}')
-        if response.status_code >= 400:
-            raise AmazonRetryableError(f'HTTP {response.status_code} on {url}')
-        html = response.text or ''
+        if status in {429, 500, 502, 503, 504}:
+            raise AmazonRetryableError(f'HTTP {status} on {url}')
+        if status >= 400:
+            raise AmazonRetryableError(f'HTTP {status} on {url}')
     finally:
         if owns_session:
             await session.close()
@@ -437,6 +504,11 @@ def _ld_brand(node: dict) -> str | None:
         return _clean_brand(brand)
     if isinstance(brand, dict):
         return _clean_brand(brand.get('name') or brand.get('brand'))
+    manufacturer = node.get('manufacturer')
+    if isinstance(manufacturer, str):
+        return _clean_brand(manufacturer)
+    if isinstance(manufacturer, dict):
+        return _clean_brand(manufacturer.get('name'))
     return None
 
 
@@ -493,7 +565,10 @@ def _about_this_item(soup: BeautifulSoup) -> list[str]:
         '#productFactsDesktopExpander li, '
         '#productFactsDesktop_feature_div li, '
         '#productFactsDesktopExpander .a-list-item, '
-        '#featurebullets_feature_div li'
+        '#featurebullets_feature_div li, '
+        '#detailBullets_feature_div li span.a-list-item, '
+        '#detailBulletsWrapper_feature_div li span.a-list-item, '
+        'div[data-feature-name="featurebullets"] li span.a-list-item'
     )
     for node in nodes:
         text = _text(node)
@@ -581,8 +656,8 @@ def _product_category_fields(crumbs: list[dict[str, str | None]]) -> dict[str, A
     }
 
 
-def parse_product_detail(html: str) -> dict[str, Any]:
-    soup = BeautifulSoup(thin_product_html(html), 'lxml')
+def _parse_product_detail_html(html: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html, 'lxml')
     brand = None
     description = None
     crumbs = _crumbs_from_wayfinding(soup)
@@ -641,6 +716,13 @@ def parse_product_detail(html: str) -> dict[str, Any]:
         'productOverview': overview,
         **_product_category_fields(crumbs),
     }
+
+
+def parse_product_detail(html: str) -> dict[str, Any]:
+    details = _parse_product_detail_html(thin_product_html(html))
+    if has_core_details(details):
+        return details
+    return _parse_product_detail_html(html)
 
 
 async def polite_pause(minimum: float = 0.2, maximum: float = 0.6) -> None:
