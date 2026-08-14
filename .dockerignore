@@ -1,0 +1,11 @@
+.venv
+.mypy_cache
+__pycache__
+.git
+.idea
+.vscode
+storage
+apify_storage
+.env
+*.md
+.DS_Store
