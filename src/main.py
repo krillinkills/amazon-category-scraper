@@ -6,7 +6,11 @@ from typing import Any
 
 from apify import Actor
 
-from .category_tree import CategoryLookupError, listing_url, resolve_category_input
+from .category_tree import (
+    CategoryLookupError,
+    listing_url_candidates,
+    resolve_category_input,
+)
 from .scraper import (
     EMPTY_PRODUCT_DETAILS,
     PDP_CUT_MARKERS,
@@ -14,6 +18,7 @@ from .scraper import (
     AmazonBlockedError,
     AmazonRetryableError,
     has_core_details,
+    listing_fetch_debug,
     parse_listing_cards,
     parse_product_detail,
     polite_pause,
@@ -21,11 +26,39 @@ from .scraper import (
     product_url,
     request_headers,
 )
-from .sticky import LISTING_REQUESTS_PER_IP, MAX_REQUESTS_PER_IP, StickyProxySession
+from .sticky import (
+    LISTING_FETCH_ATTEMPTS,
+    LISTING_PAGE1_ATTEMPTS,
+    LISTING_REQUESTS_PER_IP,
+    MAX_REQUESTS_PER_IP,
+    StickyProxySession,
+    retry_pause_seconds,
+)
 
 
 DEFAULT_CONCURRENCY = 100
 MAX_CONCURRENCY = 150
+DETAIL_QUEUE_MAX = 200
+
+
+def proxy_country_for_marketplace(marketplace: str) -> str:
+    code = (marketplace or '').strip().upper()
+    if code == 'UK':
+        return 'GB'
+    return code
+
+
+def proxy_input_with_marketplace_country(proxy_input: Any, marketplace: str) -> dict[str, Any]:
+    """Pin residential IPs to the Amazon store country when the user left country empty."""
+    filled = dict(proxy_input or {})
+    if filled.get('useApifyProxy') is False:
+        return filled
+    if filled.get('apifyProxyCountry'):
+        return filled
+    filled['useApifyProxy'] = True
+    filled.setdefault('apifyProxyGroups', ['RESIDENTIAL'])
+    filled['apifyProxyCountry'] = proxy_country_for_marketplace(marketplace)
+    return filled
 
 
 def _parse_optional_limit(value: Any, *, field: str) -> int | None:
@@ -77,45 +110,69 @@ async def _collect_listing(
     max_pages: int | None,
     max_items: int | None,
     on_item: Any | None = None,
-) -> tuple[list[dict[str, Any]], int]:
-    """Fetch every category page first. Returns unique product cards and page count."""
-    collected: list[dict[str, Any]] = []
+    stop: asyncio.Event | None = None,
+) -> tuple[int, int]:
+    """Walk listing pages. Yields cards via on_item. Returns (yielded, pages)."""
+    yielded = 0
     seen: set[str] = set()
     page = 0
 
-    while not _reached_limit(len(collected), max_items):
+    def _halt() -> bool:
+        if stop is not None and stop.is_set():
+            return True
+        if stop is None and _reached_limit(yielded, max_items):
+            return True
+        return False
+
+    while not _halt():
         if max_pages is not None and page >= max_pages:
             break
         page += 1
 
-        url = listing_url(resolved, page)
+        candidates = listing_url_candidates(resolved, page)
+        attempts = LISTING_PAGE1_ATTEMPTS if page == 1 else LISTING_FETCH_ATTEMPTS
+        html = None
+        last_error: Exception | None = None
+        cards: list[dict[str, Any]] = []
+        url = candidates[0]
         Actor.log.info(f'Listing page {page}: {url}')
+        for attempt in range(1, attempts + 1):
+            url = candidates[(attempt - 1) % len(candidates)]
+            if attempt == 1 or url != candidates[(attempt - 2) % len(candidates)]:
+                if attempt > 1:
+                    Actor.log.info(f'Listing page {page} trying {url}')
+            html, last_error = await listing.fetch_with_retries(
+                url, listing_headers, attempts=1,
+            )
+            if html:
+                cards = await asyncio.to_thread(parse_listing_cards, html, resolved.domain)
+                if cards:
+                    break
+                last_error = AmazonRetryableError(
+                    f'no product cards ({listing_fetch_debug(html)})'
+                )
+                Actor.log.warning(
+                    f'listing attempt {attempt}/{attempts} failed for {url}: {last_error}'
+                )
+                await listing.rotate('empty listing page')
+            if attempt < attempts:
+                await asyncio.sleep(
+                    retry_pause_seconds(
+                        last_error or AmazonRetryableError('listing fetch failed'),
+                        attempt,
+                    )
+                )
 
-        html, last_error = await listing.fetch_with_retries(
-            url, listing_headers, attempts=4,
-        )
-        if html is None:
+        if not cards:
             message = f'Failed to fetch {url}: {last_error}'
             Actor.log.error(message)
             if page == 1:
                 raise RuntimeError(message) from last_error
             break
 
-        cards = await asyncio.to_thread(parse_listing_cards, html, resolved.domain)
-        if not cards:
-            Actor.log.warning(f'No listing cards on page {page}; rotating listing IP and retrying.')
-            await listing.rotate('empty listing page')
-            html, _ = await listing.fetch_with_retries(url, listing_headers, attempts=3)
-            cards = await asyncio.to_thread(parse_listing_cards, html, resolved.domain) if html else []
-            if not cards:
-                Actor.log.info(f'No listing cards on page {page} after retries, stopping listing.')
-                if page == 1:
-                    raise RuntimeError(f'No product cards found on {url}')
-                break
-
         page_added = 0
         for position, card in enumerate(cards, start=1):
-            if _reached_limit(len(collected), max_items):
+            if _halt():
                 break
             asin = card['asin']
             if asin in seen:
@@ -129,22 +186,22 @@ async def _collect_listing(
                 page=page,
                 listing_page_url=url,
             )
-            collected.append(record)
+            yielded += 1
             if on_item is not None:
                 await on_item(record)
             page_added += 1
 
         Actor.log.info(
-            f'Listing page {page}: {page_added} products (total {len(collected)}).'
+            f'Listing page {page}: {page_added} products (total {yielded}).'
         )
         if page_added == 0:
             Actor.log.info(f'Listing page {page} had no new ASINs, stopping listing.')
             break
         more_pages = max_pages is None or page < max_pages
-        if more_pages and not _reached_limit(len(collected), max_items):
+        if more_pages and not _halt():
             await polite_pause(0.2, 0.6)
 
-    return collected, page
+    return yielded, page
 
 
 async def _enrich_item(
@@ -174,10 +231,7 @@ async def _enrich_item(
             )
             await sticky.rotate(f'{type(error).__name__} on attempt {attempt}')
             if attempt < attempts:
-                if isinstance(error, AmazonBlockedError):
-                    await polite_pause(0.6, 1.4)
-                else:
-                    await polite_pause(0.15, 0.5)
+                await asyncio.sleep(retry_pause_seconds(error, attempt))
             continue
 
         if not getattr(_enrich_item, '_logged_pdp_size', False):
@@ -200,25 +254,39 @@ async def _enrich_item(
     return None
 
 
-async def _enrich_all(
-    items: list[dict[str, Any]],
+async def _run_detail_pipeline(
     *,
+    listing: StickyProxySession,
+    resolved: Any,
+    run_meta: dict[str, Any],
+    listing_headers: dict[str, str],
+    detail_headers: dict[str, str],
     proxy_configuration: Any,
-    domain: str,
-    headers: dict[str, str],
+    max_pages: int | None,
+    max_items: int | None,
     concurrency: int,
-) -> tuple[int, int]:
-    """Open product pages. Store only rows with brand, bullets, or overview."""
-    if not items:
-        return 0, 0
+) -> tuple[int, int, int, int]:
+    """Listing produces ASINs; detail workers consume them at the same time.
 
-    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    Returns (stored, missed, queued, listing_pages).
+    """
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=DETAIL_QUEUE_MAX)
+    stop = asyncio.Event()
     start_gate = asyncio.Semaphore(25)
     retry_lock = asyncio.Lock()
+    push_lock = asyncio.Lock()
     retries: list[dict[str, Any]] = []
     pushed = 0
     missed = 0
+    queued = 0
     pass_name = 'pass1'
+
+    async def enqueue(record: dict[str, Any]) -> None:
+        nonlocal queued
+        if stop.is_set():
+            return
+        await queue.put(record)
+        queued += 1
 
     async def worker(index: int) -> None:
         nonlocal pushed, missed
@@ -226,6 +294,7 @@ async def _enrich_all(
             proxy_configuration,
             name=f'pdp{index}',
             max_requests=MAX_REQUESTS_PER_IP,
+            origin=f'https://{resolved.domain}',
         )
         try:
             while True:
@@ -233,6 +302,9 @@ async def _enrich_all(
                 try:
                     if payload is None:
                         return
+                    if _reached_limit(pushed, max_items):
+                        stop.set()
+                        continue
                     if sticky.http is None:
                         async with start_gate:
                             await sticky.start()
@@ -240,37 +312,47 @@ async def _enrich_all(
                     record = await _enrich_item(
                         payload,
                         sticky=sticky,
-                        domain=domain,
-                        headers=headers,
+                        domain=resolved.domain,
+                        headers=detail_headers,
                         attempts=attempts,
                         abort_after_product_block=pass_name == 'pass1',
                     )
                     if record and has_core_details(record):
-                        await Actor.push_data({
-                            **record,
-                            'hasDetails': True,
-                            'recordType': 'detail',
-                        })
-                        pushed += 1
+                        async with push_lock:
+                            if _reached_limit(pushed, max_items):
+                                stop.set()
+                                continue
+                            await Actor.push_data({
+                                **record,
+                                'hasDetails': True,
+                                'recordType': 'detail',
+                            })
+                            pushed += 1
+                            hit_limit = _reached_limit(pushed, max_items)
                         if pushed == 1:
                             Actor.log.info(f'First detailed product written: {record.get("asin")}')
                         if pushed % 25 == 0:
                             Actor.log.info(
                                 f'Stored {pushed} detailed products ({missed} still missing details).'
                             )
-                    elif pass_name == 'pass1':
+                        if hit_limit:
+                            stop.set()
+                            Actor.log.info(
+                                f'Reached maxItems={max_items}; stopping listing and extra detail fetches.'
+                            )
+                    elif pass_name == 'pass1' and not _reached_limit(pushed, max_items):
                         async with retry_lock:
                             retries.append(payload)
-                    else:
+                    elif pass_name != 'pass1':
                         missed += 1
                 except Exception as error:
                     Actor.log.exception(
                         f'pdp{index} failed on {payload.get("asin") if payload else "?"}: {error}'
                     )
-                    if payload and pass_name == 'pass1':
+                    if payload and pass_name == 'pass1' and not _reached_limit(pushed, max_items):
                         async with retry_lock:
                             retries.append(payload)
-                    elif payload:
+                    elif payload and pass_name != 'pass1':
                         missed += 1
                 finally:
                     queue.task_done()
@@ -279,23 +361,43 @@ async def _enrich_all(
 
     workers = [asyncio.create_task(worker(index)) for index in range(concurrency)]
     Actor.log.info(
-        f'{concurrency} detail workers starting on {len(items)} products '
-        f'(sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
+        f'{concurrency} detail workers ready (queue cap {DETAIL_QUEUE_MAX}, '
+        f'sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
+        'Listing continues while product pages open. '
         'Rows are stored only when brand, About this item, or overview parsed.'
     )
+    listing_pages = 0
     try:
-        for item in items:
-            await queue.put(item)
+        try:
+            _, listing_pages = await _collect_listing(
+                listing=listing,
+                resolved=resolved,
+                run_meta=run_meta,
+                listing_headers=listing_headers,
+                max_pages=max_pages,
+                max_items=None,
+                on_item=enqueue,
+                stop=stop,
+            )
+        finally:
+            await listing.close()
+        Actor.log.info(
+            f'Listing finished: {queued} unique ASINs from {listing_pages} pages. '
+            'Waiting for in-flight product pages.'
+        )
         await queue.join()
 
         retry_batch = list(retries)
         retries.clear()
-        if retry_batch:
+        need_more = not _reached_limit(pushed, max_items)
+        if retry_batch and need_more:
             pass_name = 'pass2'
             Actor.log.info(
                 f'Retrying {len(retry_batch)} products that had no brand/overview.'
             )
             for item in retry_batch:
+                if _reached_limit(pushed, max_items):
+                    break
                 await queue.put(item)
             await queue.join()
 
@@ -303,11 +405,12 @@ async def _enrich_all(
             await queue.put(None)
         await asyncio.gather(*workers, return_exceptions=True)
     except Exception:
+        stop.set()
         for worker_task in workers:
             worker_task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         raise
-    return pushed, missed
+    return pushed, missed, queued, listing_pages
 
 
 async def main() -> None:
@@ -328,7 +431,10 @@ async def main() -> None:
         if not marketplace:
             raise ValueError('marketplace is required.')
         if not category and not (department and subcategory):
-            raise ValueError('category is required, e.g. "Mobiles, Computers -> All Mobile Phones".')
+            raise ValueError(
+                'Pick department and subcategory, or a category path '
+                'like "Mobiles, Computers -> All Mobile Phones".'
+            )
 
         try:
             resolved = resolve_category_input(
@@ -344,7 +450,15 @@ async def main() -> None:
         scraped_at = datetime.now(timezone.utc).replace(microsecond=0)
         scraped_at_iso = scraped_at.strftime('%Y-%m-%dT%H:%M:%SZ')
         scraped_date = scraped_at.strftime('%Y-%m-%d')
-        proxy_input = actor_input.get('proxyConfiguration') or {}
+        proxy_input = proxy_input_with_marketplace_country(
+            actor_input.get('proxyConfiguration'),
+            resolved.marketplace,
+        )
+        if not (actor_input.get('proxyConfiguration') or {}).get('apifyProxyCountry'):
+            Actor.log.info(
+                f'Proxy country was empty; using {proxy_input.get("apifyProxyCountry")} '
+                f'to match {resolved.domain}.'
+            )
         run_meta = {
             'scrapedAt': scraped_at_iso,
             'scrapedDate': scraped_date,
@@ -367,19 +481,21 @@ async def main() -> None:
             f'({pages_label}, {items_label}, '
             f'details={"on" if enrich_details else "off"}, concurrency={concurrency}, '
             f'sticky IPs rotate every {MAX_REQUESTS_PER_IP} product pages). '
-            'Phase 1 collects every listing card; phase 2 opens product pages.'
+            'Listing and product-detail fetches run at the same time.'
         )
 
         proxy_configuration = await Actor.create_proxy_configuration(
-            actor_proxy_input=actor_input.get('proxyConfiguration'),
+            actor_proxy_input=proxy_input,
         )
-        listing_headers = request_headers()
-        detail_headers = request_headers(resolved.marketplace)
+        origin = f'https://{resolved.domain}'
+        listing_headers = request_headers(resolved.marketplace, referer=f'{origin}/')
+        detail_headers = request_headers(resolved.marketplace, referer=f'{origin}/')
 
         listing = StickyProxySession(
             proxy_configuration,
             name='listing',
             max_requests=LISTING_REQUESTS_PER_IP,
+            origin=origin,
         )
         await listing.start()
 
@@ -388,45 +504,42 @@ async def main() -> None:
         detail_ok = 0
         detail_fail = 0
         listing_pages = 0
-        collected: list[dict[str, Any]] = []
 
         async def _store_listing_card(record: dict[str, Any]) -> None:
             nonlocal pushed
             await Actor.push_data(record)
             pushed += 1
 
-        try:
-            collected, listing_pages = await _collect_listing(
+        if not enrich_details:
+            try:
+                queued, listing_pages = await _collect_listing(
+                    listing=listing,
+                    resolved=resolved,
+                    run_meta=run_meta,
+                    listing_headers=listing_headers,
+                    max_pages=max_pages,
+                    max_items=max_items,
+                    on_item=_store_listing_card,
+                )
+            finally:
+                await listing.close()
+            Actor.log.info(f'Done. Stored {pushed} listing cards from {listing_pages} pages.')
+        else:
+            pushed, detail_fail, queued, listing_pages = await _run_detail_pipeline(
                 listing=listing,
                 resolved=resolved,
                 run_meta=run_meta,
                 listing_headers=listing_headers,
+                detail_headers=detail_headers,
+                proxy_configuration=proxy_configuration,
                 max_pages=max_pages,
                 max_items=max_items,
-                on_item=None if enrich_details else _store_listing_card,
-            )
-            queued = len(collected)
-        finally:
-            await listing.close()
-
-        if not enrich_details:
-            Actor.log.info(f'Done. Stored {pushed} listing cards from {listing_pages} pages.')
-        else:
-            Actor.log.info(
-                f'Listing done: {queued} products from {listing_pages} pages. '
-                f'Opening product pages with {concurrency} workers.'
-            )
-            pushed, detail_fail = await _enrich_all(
-                collected,
-                proxy_configuration=proxy_configuration,
-                domain=resolved.domain,
-                headers=detail_headers,
                 concurrency=concurrency,
             )
             detail_ok = pushed
             Actor.log.info(
                 f'Done. Stored {pushed} products with brand/overview '
-                f'({detail_fail} ASINs omitted after retries).'
+                f'({detail_fail} ASINs omitted after retries, {queued} queued from listing).'
             )
 
         await Actor.set_value('SCRAPE_META', {

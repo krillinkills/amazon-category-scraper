@@ -19,20 +19,29 @@ from .scraper import (
     AmazonRetryableError,
     create_session,
     fetch_html,
-    polite_pause,
 )
 
 IMPERSONATE_POOL = (
-    'chrome',
     'chrome131',
     'chrome136',
-    'chrome146',
-    'safari184',
-    'edge101',
+    'chrome124',
+    'chrome120',
 )
-DEFAULT_IMPERSONATE = 'chrome'
+DEFAULT_IMPERSONATE = 'chrome131'
 MAX_REQUESTS_PER_IP = 25
 LISTING_REQUESTS_PER_IP = 15
+LISTING_FETCH_ATTEMPTS = 8
+LISTING_PAGE1_ATTEMPTS = 12
+_SLOW_RETRY_MARKERS = ('HTTP 429', 'HTTP 500', 'HTTP 502', 'HTTP 503', 'HTTP 504')
+
+
+def retry_pause_seconds(error: Exception, attempt: int) -> float:
+    """Wait longer after Amazon 503/429/blocks so a new IP can cool down."""
+    text = str(error)
+    slow = isinstance(error, AmazonBlockedError) or any(marker in text for marker in _SLOW_RETRY_MARKERS)
+    if slow:
+        return min(12.0, 1.25 * (2 ** (attempt - 1))) + random.uniform(0.25, 0.75)
+    return random.uniform(0.15, 0.5)
 
 
 class StickyProxySession:
@@ -42,14 +51,17 @@ class StickyProxySession:
         *,
         name: str,
         max_requests: int = MAX_REQUESTS_PER_IP,
+        origin: str | None = None,
     ) -> None:
         self.proxy_configuration = proxy_configuration
         self.name = name
         self.max_requests = max_requests
+        self.origin = origin.rstrip('/') if origin else None
         self.session_id: str | None = None
         self.http: AsyncSession | None = None
         self.requests_on_ip = 0
         self.rotations = 0
+        self._warmed = False
 
     async def start(self) -> None:
         await self.rotate('start')
@@ -73,8 +85,22 @@ class StickyProxySession:
             self.http = await asyncio.to_thread(_open, DEFAULT_IMPERSONATE)
         self.requests_on_ip = 0
         self.rotations += 1
+        self._warmed = False
         if reason != 'start':
             Actor.log.info(f'Rotated sticky IP {self.name} -> {self.session_id} ({reason})')
+
+    async def _warmup(self, headers: dict[str, str]) -> None:
+        if self._warmed or not self.origin or self.http is None:
+            return
+        try:
+            await fetch_html(f'{self.origin}/', session=self.http, headers=headers)
+        except (AmazonBlockedError, AmazonRetryableError) as error:
+            # US CloudFront often 503s the first hit while setting session cookies.
+            Actor.log.info(f'{self.name} homepage warmup got {error}; keeping IP for listing')
+        except Exception as error:
+            Actor.log.warning(f'{self.name} homepage warmup failed: {error}')
+        self.requests_on_ip += 1
+        self._warmed = True
 
     async def fetch(
         self,
@@ -87,7 +113,15 @@ class StickyProxySession:
         if self.requests_on_ip >= self.max_requests:
             await self.rotate(f'proactive after {self.requests_on_ip} requests')
         assert self.http is not None
-        html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
+        if not self._warmed and self.origin:
+            await self._warmup(headers)
+        try:
+            html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
+        except AmazonRetryableError as error:
+            if not any(code in str(error) for code in ('HTTP 503', 'HTTP 429', 'HTTP 502')):
+                raise
+            Actor.log.info(f'{self.name} {error}; retrying once on the same IP')
+            html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
         self.requests_on_ip += 1
         return html
 
@@ -110,10 +144,7 @@ class StickyProxySession:
                 )
                 await self.rotate(f'{type(error).__name__} on attempt {attempt}')
                 if attempt < attempts:
-                    if isinstance(error, AmazonBlockedError):
-                        await polite_pause(0.6, 1.4)
-                    else:
-                        await polite_pause(0.15, 0.5)
+                    await asyncio.sleep(retry_pause_seconds(error, attempt))
         return None, last_error
 
     async def close(self) -> None:

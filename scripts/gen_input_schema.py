@@ -32,8 +32,11 @@ def main() -> None:
 
     category_enum: list[str] = []
     seen: set[str] = set()
+    preferred = 'IN'
+    market_order = [preferred] + [code for code in categories if code != preferred]
 
-    for tree in categories.values():
+    for code in market_order:
+        tree = categories.get(code) or {}
         for department in tree.get('departments', []):
             dept_name = department['name']
             all_label = category_label(dept_name, ALL_OPTION)
@@ -61,16 +64,19 @@ def main() -> None:
                 'default': 'IN',
             },
             'category': {
-                'title': 'Category',
+                'title': 'Department -> Subcategory',
                 'type': 'string',
                 'description': (
-                    'One All-menu path: Department -> Subcategory. '
+                    'One All-menu path. Department and subcategory are in this single dropdown, '
+                    f'e.g. "Beauty, Health, Grocery -> Health & Personal Care". '
                     f'Pick "Department -> {ALL_OPTION}" to scrape the whole department. '
-                    'The path must exist for the selected marketplace.'
+                    'Short names such as "Electronics -> Headphones" also resolve on marketplaces '
+                    'that group that department (India: "TV, Appliances, Electronics").'
                 ),
                 'editor': 'select',
                 'enum': category_enum,
                 'enumTitles': category_enum,
+                'sectionCaption': 'What to scrape',
             },
             'maxPages': {
                 'title': 'Pages to scrape',
@@ -87,8 +93,8 @@ def main() -> None:
                 'title': 'Max items',
                 'type': 'integer',
                 'description': (
-                    'Stop after this many product cards. 0 or empty means no item limit: '
-                    'keep going until listing pages run out.'
+                    'With product details on, stop after this many stored product rows. '
+                    '0 or empty means no item limit.'
                 ),
                 'minimum': 0,
                 'default': 0,
@@ -98,7 +104,8 @@ def main() -> None:
                 'type': 'boolean',
                 'description': (
                     'Open each product page for brand, About this item, description, and overview. '
-                    'Listing-card fields are still saved if a detail page fails.'
+                    'Rows are stored only when those details parse. '
+                    'Turn off to store listing cards only.'
                 ),
                 'default': True,
                 'sectionCaption': 'Product details',
@@ -117,7 +124,11 @@ def main() -> None:
             'proxyConfiguration': {
                 'title': 'Proxy',
                 'type': 'object',
-                'description': 'Residential proxies with sticky sessions. Amazon blocks most datacenter IPs.',
+                'description': (
+                    'Residential proxies with sticky sessions. Amazon blocks most datacenter IPs. '
+                    'If you leave country empty, the actor uses the selected marketplace '
+                    '(US store → US IPs). Mismatched country often returns HTTP 503 on listing page 1.'
+                ),
                 'editor': 'proxy',
                 'sectionCaption': 'Proxy and browser',
                 'default': {

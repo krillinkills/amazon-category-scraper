@@ -19,10 +19,13 @@ ROBOT_MARKERS = (
     '/errors/validateCaptcha',
     'api-services-support@amazon.com',
     'sorry, we just need to make sure you',
+    'automated access to amazon',
+    'click the button below to continue',
+    'to continue shopping',
+    'sorry, something went wrong on our end',
 )
 
 DEFAULT_HEADERS = {
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
@@ -140,11 +143,22 @@ def accept_language_for(marketplace: str) -> str:
     return ACCEPT_LANGUAGE.get((marketplace or '').upper(), DEFAULT_HEADERS['Accept-Language'])
 
 
-def request_headers(marketplace: str | None = None) -> dict[str, str]:
-    headers = dict(DEFAULT_HEADERS)
-    if marketplace:
-        headers['Accept-Language'] = accept_language_for(marketplace)
+def request_headers(marketplace: str | None = None, *, referer: str | None = None) -> dict[str, str]:
+    """Only override Accept-Language / Referer so curl_cffi can keep Chrome's other headers."""
+    headers = {'Accept-Language': accept_language_for(marketplace or '')}
+    if referer:
+        headers['Referer'] = referer
     return headers
+
+
+def listing_fetch_debug(html: str) -> str:
+    title = ''
+    match = re.search(r'<title[^>]*>([^<]+)', html or '', re.I)
+    if match:
+        title = re.sub(r'\s+', ' ', match.group(1)).strip()[:90]
+    has_search = 'data-component-type="s-search-result"' in (html or '')
+    has_asin = 'data-asin="' in (html or '')
+    return f'{len(html or "")} chars, title={title!r}, search-result={has_search}, data-asin={has_asin}'
 
 
 def product_url(domain: str, asin: str) -> str:
@@ -302,13 +316,14 @@ async def fetch_html(
         status = 0
         html = ''
         try:
-            response = await session.get(
-                url,
-                headers=headers or DEFAULT_HEADERS,
-                timeout=timeout,
-                allow_redirects=True,
-                content_callback=abort_buf,
-            )
+            get_kwargs: dict[str, Any] = {
+                'timeout': timeout,
+                'allow_redirects': True,
+                'content_callback': abort_buf,
+            }
+            if headers:
+                get_kwargs['headers'] = headers
+            response = await session.get(url, **get_kwargs)
             status = response.status_code
             html = abort_buf.text() if abort_buf is not None else (response.text or '')
         except RequestException as error:

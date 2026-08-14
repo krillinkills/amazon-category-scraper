@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 DATA_DIR = Path(__file__).resolve().parent
 ALL_OPTION = '(All)'
@@ -64,12 +65,57 @@ def _department_names(tree: dict) -> list[str]:
     return [department['name'] for department in tree.get('departments', [])]
 
 
+_FILLER_TOKENS = frozenset({'and', 'the', 'of'})
+
+
+def _tokens(value: str) -> list[str]:
+    return _norm_name(value).split()
+
+
+def _significant_tokens(value: str) -> list[str]:
+    return [token for token in _tokens(value) if token not in _FILLER_TOKENS]
+
+
+def _contains_tokens(haystack_name: str, needle_name: str) -> bool:
+    needle = _significant_tokens(needle_name)
+    haystack = _significant_tokens(haystack_name)
+    if not needle or not haystack:
+        return False
+    width = len(needle)
+    if any(haystack[index : index + width] == needle for index in range(len(haystack) - width + 1)):
+        return True
+    return set(needle) <= set(haystack)
+
+
 def _find_department(tree: dict, department_name: str) -> dict | None:
     wanted = _norm_name(department_name)
     for department in tree.get('departments', []):
         if _norm_name(department['name']) == wanted:
             return department
     return None
+
+
+def _department_candidates(tree: dict, department_name: str) -> list[dict]:
+    exact = _find_department(tree, department_name)
+    if exact is not None:
+        return [exact]
+    return [
+        department
+        for department in tree.get('departments', [])
+        if _contains_tokens(department['name'], department_name)
+    ]
+
+
+def _children_with_name(tree: dict, subcategory_name: str) -> list[tuple[dict, dict]]:
+    matches: list[tuple[dict, dict]] = []
+    wanted = _norm_name(subcategory_name)
+    if not wanted or wanted == _norm_name(ALL_OPTION):
+        return matches
+    for department in tree.get('departments', []):
+        for child in department.get('children', []):
+            if _norm_name(child['name']) == wanted:
+                matches.append((department, child))
+    return matches
 
 
 PATH_SEPARATORS = (' -> ', ' → ', ' > ')
@@ -161,38 +207,63 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
         raise CategoryLookupError(f'No All-menu tree is shipped for marketplace {iso}.')
 
     department_name = _strip_path_prefix(department)
-    found_department = _find_department(tree, department_name)
-    if found_department is None:
-        available = ', '.join(_department_names(tree))
-        raise CategoryLookupError(
-            f'Department {department!r} is not in the {iso} All menu. Available: {available}.'
-        )
-
-    child_name = _subcategory_name(found_department['name'], subcategory)
+    candidates = _department_candidates(tree, department_name)
+    child_name = _subcategory_name(candidates[0]['name'] if candidates else department_name, subcategory)
     if not child_name:
         raise CategoryLookupError('Subcategory is required.')
 
     if _norm_name(child_name) == _norm_name(ALL_OPTION):
-        url_path = found_department.get('url') or (
-            found_department['children'][0]['url'] if found_department.get('children') else None
-        )
-        if not url_path:
-            raise CategoryLookupError(f'Department {found_department["name"]!r} has no listing URL.')
-        return ResolvedCategory(
-            marketplace=iso,
-            domain=market.domain,
-            currency=market.currency,
-            department=found_department['name'],
-            subcategory=ALL_OPTION,
-            category_path=format_category_path(found_department['name'], ALL_OPTION),
-            url_path=url_path,
-            market_name=market.name,
-            browse_node_id=_browse_node_id(found_department) or browse_node_id_from_url(url_path),
+        if len(candidates) == 1:
+            return _resolved_department_all(market, iso, candidates[0])
+        if len(candidates) > 1:
+            names = ' | '.join(item['name'] for item in candidates)
+            raise CategoryLookupError(
+                f'Department {department!r} matches more than one {iso} All-menu group: {names}. '
+                f'Pick the full path, e.g. "{candidates[0]["name"]} -> {ALL_OPTION}".'
+            )
+        available = ' | '.join(_department_names(tree))
+        raise CategoryLookupError(
+            f'Department {department!r} is not in the {iso} All menu. Available: {available}.'
         )
 
-    found_child = _find_child(found_department, child_name)
+    found_department = None
+    found_child = None
+    if len(candidates) == 1:
+        found_department = candidates[0]
+        found_child = _find_child(found_department, child_name)
+    elif len(candidates) > 1:
+        with_child = [
+            (item, _find_child(item, child_name))
+            for item in candidates
+        ]
+        with_child = [(item, child) for item, child in with_child if child is not None]
+        if len(with_child) == 1:
+            found_department, found_child = with_child[0]
+        elif len(with_child) > 1:
+            names = ' | '.join(item['name'] for item, _child in with_child)
+            raise CategoryLookupError(
+                f'{subcategory!r} is under more than one {iso} department matching {department!r}: {names}.'
+            )
+
     if found_child is None:
-        available = ', '.join(_child_names(found_department)) or '(none)'
+        elsewhere = _children_with_name(tree, child_name)
+        if len(elsewhere) == 1:
+            found_department, found_child = elsewhere[0]
+        elif len(elsewhere) > 1:
+            names = ' | '.join(item['name'] for item, _child in elsewhere)
+            raise CategoryLookupError(
+                f'Subcategory {subcategory!r} exists under more than one {iso} department: {names}. '
+                f'Pick the full path, e.g. "{elsewhere[0][0]["name"]} -> {elsewhere[0][1]["name"]}".'
+            )
+
+    if found_department is None:
+        available = ' | '.join(_department_names(tree))
+        raise CategoryLookupError(
+            f'Department {department!r} is not in the {iso} All menu. Available: {available}.'
+        )
+
+    if found_child is None:
+        available = ' | '.join(_child_names(found_department)) or '(none)'
         raise CategoryLookupError(
             f'Subcategory {subcategory!r} is not under {found_department["name"]!r} on {iso}. '
             f'Available: {available}.'
@@ -211,18 +282,54 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
     )
 
 
-def listing_url(resolved: ResolvedCategory, page: int = 1) -> str:
+def _resolved_department_all(market: Market, iso: str, found_department: dict) -> ResolvedCategory:
+    url_path = found_department.get('url') or (
+        found_department['children'][0]['url'] if found_department.get('children') else None
+    )
+    if not url_path:
+        raise CategoryLookupError(f'Department {found_department["name"]!r} has no listing URL.')
+    return ResolvedCategory(
+        marketplace=iso,
+        domain=market.domain,
+        currency=market.currency,
+        department=found_department['name'],
+        subcategory=ALL_OPTION,
+        category_path=format_category_path(found_department['name'], ALL_OPTION),
+        url_path=url_path,
+        market_name=market.name,
+        browse_node_id=_browse_node_id(found_department) or browse_node_id_from_url(url_path),
+    )
+
+
+def _absolute_listing_url(resolved: ResolvedCategory) -> str:
     path = resolved.url_path
     if path.startswith('http://') or path.startswith('https://'):
-        url = path
-    else:
-        url = f'https://{resolved.domain}{path}'
-    separator = '&' if '?' in url else '?'
-    extras: list[str] = []
-    if '/s?' in url and 'fs=' not in url:
-        extras.append('fs=true')
-    if 'page=' not in url:
-        extras.append(f'page={page}')
-    if not extras:
-        return url
-    return f'{url}{separator}{"&".join(extras)}'
+        return path
+    return f'https://{resolved.domain}{path}'
+
+
+def listing_url(resolved: ResolvedCategory, page: int = 1, *, include_fs: bool = True) -> str:
+    parsed = urlparse(_absolute_listing_url(resolved))
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if include_fs and parsed.path.startswith('/s') and 'fs' not in query:
+        query['fs'] = 'true'
+    if not include_fs:
+        query.pop('fs', None)
+    query['page'] = str(page)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def listing_url_candidates(resolved: ResolvedCategory, page: int = 1) -> list[str]:
+    urls = [listing_url(resolved, page, include_fs=True)]
+    without_fs = listing_url(resolved, page, include_fs=False)
+    if without_fs not in urls:
+        urls.append(without_fs)
+    node = resolved.browse_node_id
+    if node and page == 1:
+        for extra in (
+            f'https://{resolved.domain}/s?rh=n%3A{node}&fs=true&page=1',
+            f'https://{resolved.domain}/b?node={node}',
+        ):
+            if extra not in urls:
+                urls.append(extra)
+    return urls
