@@ -10,7 +10,7 @@ You pick a marketplace ISO code and one All-menu path: `Department -> Subcategor
 | --- | --- |
 | `marketplace` | ISO country code (`IN`, `US`, `GB`, `DE`, …). `UK` is accepted as an alias for `GB`. |
 | `category` | One path from the All menu, e.g. `Mobiles, Computers -> All Mobile Phones`. Use `Department -> (All)` for the whole department. |
-| `maxPages` or `pages` | **Required.** How many listing pages to fetch (1–100). |
+| `maxPages` or `pages` | Optional. How many listing pages to fetch. `0` or omit = no page limit (stop when Amazon has no new products, or at `maxItems`). |
 | `maxItems` | Default `5000`. |
 | `enrichDetails` | Default `true`. Fetch brand / About this item from each `/dp/ASIN` page. |
 | `maxConcurrency` | Default `50`. Worker pool size. Each worker keeps a sticky residential IP and rotates it after ~25 product pages or on a block. |
@@ -20,7 +20,7 @@ The Console has a single Category dropdown. Labels are `Department -> Subcategor
 
 The path must exist for that marketplace. A mismatch fails and lists the valid children.
 
-Listing pages stay sequential on one sticky IP (rotated every 10 pages or on a 503). Product-detail fetches run in a 50-wide pool: each worker reuses one residential IP, then rotates on captcha/timeout or after 25 products. A failed detail page still stores the listing card.
+Listing pages stay sequential on one sticky IP (rotated every 10 pages or on a 503). Product-detail fetches run in a 50-wide pool: each worker reuses one residential IP, then rotates on captcha/timeout or after 25 products. A details run stores one row per ASIN after `/dp` is fetched. A failed detail page still stores that one row with listing fields and empty detail columns. Set `enrichDetails` to `false` to store listing cards only.
 
 ## Example
 
@@ -46,7 +46,7 @@ Details (when `enrichDetails` is on): `brand`, `aboutThisItem`, `description`, `
 
 Scrape snapshot (on every row, for later analysis): `scrapedAt`, `scrapedDate`, `runId`, `marketplace`, `marketName`, `domain`, `browseNodeId`, `department`, `subcategory`, `categoryPath`, `listingUrl`, `proxyCountry`, `recordType`
 
-`recordType` is `listing` when the category card is stored and `detail` after the product page is fetched. Filter to `recordType=detail` (or `hasDetails=true`) so you do not double-count ASINs in a details run.
+`recordType` is `detail` when product pages are fetched (default) and `listing` only when `enrichDetails` is off. Each ASIN is stored once.
 
 The run also writes a `SCRAPE_META` object to the default key-value store: input limits, node id, item counts, `finishedAt`.
 

@@ -19,6 +19,18 @@ from .scraper import (
 from .sticky import LISTING_REQUESTS_PER_IP, MAX_REQUESTS_PER_IP, StickyProxySession
 
 
+def _parse_max_pages(pages_input: Any) -> int | None:
+    if pages_input is None or pages_input == '':
+        return None
+    try:
+        value = int(pages_input)
+    except (TypeError, ValueError) as error:
+        raise ValueError('pages / maxPages must be an integer. Use 0 for no limit.') from error
+    if value <= 0:
+        return None
+    return value
+
+
 async def _enrich_item(
     item: dict[str, Any],
     *,
@@ -55,12 +67,7 @@ async def main() -> None:
             raise ValueError('marketplace is required.')
         if not category and not (department and subcategory):
             raise ValueError('category is required, e.g. "Mobiles, Computers -> All Mobile Phones".')
-        if pages_input is None:
-            raise ValueError('pages / maxPages is required. Tell the actor how many listing pages to fetch.')
-        max_pages = int(pages_input)
-        if max_pages < 1:
-            raise ValueError('pages must be at least 1.')
-        max_pages = min(max_pages, 100)
+        max_pages = _parse_max_pages(pages_input)
 
         try:
             resolved = resolve_category_input(
@@ -91,10 +98,11 @@ async def main() -> None:
             'proxyCountry': proxy_input.get('apifyProxyCountry'),
         }
 
+        pages_label = 'unlimited pages' if max_pages is None else f'max {max_pages} pages'
         Actor.log.info(
             f'Scraping {resolved.marketplace} {resolved.category_path} '
             f'on {resolved.domain} node={resolved.browse_node_id} '
-            f'(max {max_pages} pages, {max_items} items, '
+            f'({pages_label}, {max_items} items, '
             f'details={"on" if enrich_details else "off"}, concurrency={concurrency}, '
             f'sticky IPs rotate every {MAX_REQUESTS_PER_IP} product pages)'
         )
@@ -143,13 +151,19 @@ async def main() -> None:
                             domain=resolved.domain,
                             headers=detail_headers,
                         )
-                        if record.get('brand') or record.get('aboutThisItem') or record.get('description'):
+                        got_details = bool(
+                            record.get('brand')
+                            or record.get('aboutThisItem')
+                            or record.get('description')
+                            or record.get('productCategoryPath')
+                        )
+                        if got_details:
                             detail_ok += 1
                         else:
                             detail_fail += 1
                         await Actor.push_data({
                             **record,
-                            'hasDetails': True,
+                            'hasDetails': got_details,
                             'recordType': 'detail',
                         })
                         pushed += 1
@@ -161,6 +175,14 @@ async def main() -> None:
                             )
                     except Exception as error:
                         Actor.log.exception(f'pdp{index} failed on {payload.get("asin") if payload else "?"}: {error}')
+                        if payload:
+                            detail_fail += 1
+                            await Actor.push_data({
+                                **payload,
+                                'hasDetails': False,
+                                'recordType': 'detail',
+                            })
+                            pushed += 1
                     finally:
                         queue.task_done()
             finally:
@@ -171,13 +193,15 @@ async def main() -> None:
             Actor.log.info(
                 f'{worker_count} detail workers ready '
                 f'(sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
-                'Listing cards are written immediately; brand/About this item follow.'
+                'Each product is stored once after the /dp page is fetched.'
             )
 
         try:
-            for page in range(1, max_pages + 1):
-                if queued >= max_items:
+            page = 0
+            while queued < max_items:
+                if max_pages is not None and page >= max_pages:
                     break
+                page += 1
 
                 url = listing_url(resolved, page)
                 Actor.log.info(f'Fetching page {page}: {url}')
@@ -224,18 +248,24 @@ async def main() -> None:
                         'hasDetails': False,
                         'recordType': 'listing',
                     }
-                    await Actor.push_data(record)
                     if enrich_details:
                         await queue.put(record)
                     else:
+                        await Actor.push_data(record)
                         pushed += 1
                     queued += 1
                     page_added += 1
 
                 Actor.log.info(
-                    f'Page {page}: stored {page_added} listing cards (total {queued}).'
+                    f'Page {page}: queued {page_added} products (total {queued}).'
+                    if enrich_details
+                    else f'Page {page}: stored {page_added} listing cards (total {queued}).'
                 )
-                if page < max_pages and queued < max_items:
+                if page_added == 0:
+                    Actor.log.info(f'Page {page} had no new ASINs, stopping.')
+                    break
+                more_pages = max_pages is None or page < max_pages
+                if more_pages and queued < max_items:
                     await polite_pause()
         finally:
             for _ in workers:

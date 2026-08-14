@@ -75,10 +75,12 @@ def main() -> None:
             'maxPages': {
                 'title': 'Pages to scrape',
                 'type': 'integer',
-                'description': 'How many Amazon listing pages to fetch. Set this yourself (1–100). Amazon often stops returning new cards after about 20 pages.',
-                'minimum': 1,
-                'maximum': 100,
-                'prefill': 5,
+                'description': (
+                    'How many Amazon listing pages to fetch. 0 or empty means no page limit: '
+                    'keep going until Amazon returns no new products or maxItems is reached.'
+                ),
+                'minimum': 0,
+                'default': 0,
                 'sectionCaption': 'How much to scrape',
             },
             'maxItems': {
@@ -122,7 +124,7 @@ def main() -> None:
                 },
             },
         },
-        'required': ['marketplace', 'category', 'maxPages'],
+        'required': ['marketplace', 'category'],
     }
 
     OUT_PATH.write_text(json.dumps(schema, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
