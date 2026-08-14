@@ -93,26 +93,36 @@ def _is_blocked(html: str) -> bool:
     return any(marker.casefold() in lowered for marker in ROBOT_MARKERS)
 
 
-def create_session(max_clients: int) -> AsyncSession:
-    return AsyncSession(impersonate='chrome', max_clients=max_clients)
+def create_session(
+    max_clients: int,
+    proxy_url: str | None = None,
+    impersonate: str = 'chrome',
+) -> AsyncSession:
+    kwargs: dict[str, Any] = {
+        'impersonate': impersonate,
+        'max_clients': max_clients,
+        'timeout': 35,
+    }
+    if proxy_url:
+        kwargs['proxy'] = proxy_url
+    return AsyncSession(**kwargs)
 
 
 async def fetch_html(
     url: str,
     proxy_url: str | None = None,
-    timeout: int = 30,
+    timeout: int = 35,
     session: AsyncSession | None = None,
     headers: dict[str, str] | None = None,
 ) -> str:
     owns_session = session is None
     if session is None:
-        session = create_session(max_clients=1)
+        session = create_session(max_clients=1, proxy_url=proxy_url)
     try:
         try:
             response = await session.get(
                 url,
                 headers=headers or DEFAULT_HEADERS,
-                proxy=proxy_url,
                 timeout=timeout,
                 allow_redirects=True,
             )

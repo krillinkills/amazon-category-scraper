@@ -1,0 +1,105 @@
+"""Sticky residential IPs with rotation, same pattern as the Reddit scraper.
+
+Each worker keeps one Apify proxy session id (one upstream IP) and reuses the
+curl connection. The IP is retired on a block/timeout, or proactively after a
+fixed number of requests so a single address does not accumulate heat.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from apify import Actor
+from curl_cffi.requests import AsyncSession
+
+from .scraper import AmazonBlockedError, AmazonRetryableError, fetch_html, polite_pause
+
+IMPERSONATE_POOL = ('chrome', 'chrome116', 'chrome119', 'chrome120', 'edge101', 'safari15_5')
+DEFAULT_IMPERSONATE = 'chrome'
+MAX_REQUESTS_PER_IP = 25
+LISTING_REQUESTS_PER_IP = 10
+
+
+class StickyProxySession:
+    def __init__(
+        self,
+        proxy_configuration: Any | None,
+        *,
+        name: str,
+        max_requests: int = MAX_REQUESTS_PER_IP,
+    ) -> None:
+        self.proxy_configuration = proxy_configuration
+        self.name = name
+        self.max_requests = max_requests
+        self.session_id: str | None = None
+        self.http: AsyncSession | None = None
+        self.requests_on_ip = 0
+        self.rotations = 0
+
+    async def start(self) -> None:
+        await self.rotate('start')
+
+    async def rotate(self, reason: str) -> None:
+        if self.http is not None:
+            await self.http.close()
+            self.http = None
+        self.session_id = f'{self.name}_{random.randint(0, 1_000_000_000)}'
+        proxy_url = None
+        if self.proxy_configuration is not None:
+            proxy_url = await self.proxy_configuration.new_url(self.session_id)
+        profile = random.choice(IMPERSONATE_POOL)
+        try:
+            self.http = AsyncSession(
+                proxy=proxy_url,
+                impersonate=profile,
+                max_clients=2,
+                timeout=35,
+            )
+        except Exception:
+            self.http = AsyncSession(
+                proxy=proxy_url,
+                impersonate=DEFAULT_IMPERSONATE,
+                max_clients=2,
+                timeout=35,
+            )
+        self.requests_on_ip = 0
+        self.rotations += 1
+        if reason != 'start':
+            Actor.log.info(f'Rotated sticky IP {self.name} -> {self.session_id} ({reason})')
+
+    async def fetch(self, url: str, headers: dict[str, str]) -> str:
+        if self.http is None:
+            await self.start()
+        if self.requests_on_ip >= self.max_requests:
+            await self.rotate(f'proactive after {self.requests_on_ip} requests')
+        assert self.http is not None
+        html = await fetch_html(url, session=self.http, headers=headers)
+        self.requests_on_ip += 1
+        return html
+
+    async def fetch_with_retries(
+        self,
+        url: str,
+        headers: dict[str, str],
+        *,
+        attempts: int = 3,
+    ) -> tuple[str | None, Exception | None]:
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self.fetch(url, headers), None
+            except (AmazonBlockedError, AmazonRetryableError, Exception) as error:
+                last_error = error
+                Actor.log.warning(
+                    f'{self.name} attempt {attempt}/{attempts} failed for {url}: {error}'
+                )
+                await self.rotate(f'{type(error).__name__} on attempt {attempt}')
+                if attempt < attempts:
+                    await polite_pause(1.2, 2.8)
+        return None, last_error
+
+    async def close(self) -> None:
+        if self.http is not None:
+            await self.http.close()
+            self.http = None

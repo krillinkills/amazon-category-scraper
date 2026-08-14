@@ -75,9 +75,9 @@ def main() -> None:
             'maxPages': {
                 'title': 'Pages to scrape',
                 'type': 'integer',
-                'description': 'How many Amazon listing pages to fetch. Set this yourself (1–20). Amazon usually stops after about 20 pages.',
+                'description': 'How many Amazon listing pages to fetch. Set this yourself (1–100). Amazon often stops returning new cards after about 20 pages.',
                 'minimum': 1,
-                'maximum': 20,
+                'maximum': 100,
                 'prefill': 5,
                 'sectionCaption': 'How much to scrape',
             },
@@ -86,8 +86,8 @@ def main() -> None:
                 'type': 'integer',
                 'description': 'Stop after this many product cards.',
                 'minimum': 1,
-                'maximum': 1000,
-                'default': 1000,
+                'maximum': 10000,
+                'default': 5000,
             },
             'enrichDetails': {
                 'title': 'Fetch product details',
@@ -102,18 +102,24 @@ def main() -> None:
             'maxConcurrency': {
                 'title': 'Detail-page concurrency',
                 'type': 'integer',
-                'description': 'How many product pages to fetch at once. Each request uses its own proxy IP. Default 50.',
+                'description': (
+                    'How many product pages to fetch at once. Each worker keeps a sticky residential IP '
+                    'and rotates it after about 25 pages or on a block. Default 50.'
+                ),
                 'minimum': 1,
-                'maximum': 50,
+                'maximum': 100,
                 'default': 50,
             },
             'proxyConfiguration': {
                 'title': 'Proxy',
                 'type': 'object',
-                'description': 'Residential proxies are recommended. Amazon blocks most datacenter IPs.',
+                'description': 'Residential proxies with sticky sessions. Amazon blocks most datacenter IPs.',
                 'editor': 'proxy',
                 'sectionCaption': 'Proxy and browser',
-                'default': {'useApifyProxy': True},
+                'default': {
+                    'useApifyProxy': True,
+                    'apifyProxyGroups': ['RESIDENTIAL'],
+                },
             },
         },
         'required': ['marketplace', 'category', 'maxPages'],
