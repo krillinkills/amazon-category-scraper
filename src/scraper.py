@@ -104,7 +104,7 @@ def create_session(
         'timeout': 35,
     }
     if proxy_url:
-        kwargs['proxy'] = proxy_url
+        kwargs['proxies'] = {'http': proxy_url, 'https': proxy_url}
     return AsyncSession(**kwargs)
 
 

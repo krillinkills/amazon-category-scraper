@@ -8,6 +8,7 @@ apify_storage/
 .vscode/
 .DS_Store
 .env
+run-input.json
 *.egg-info/
 dist/
 build/

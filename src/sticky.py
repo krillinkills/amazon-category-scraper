@@ -7,6 +7,7 @@ fixed number of requests so a single address does not accumulate heat.
 
 from __future__ import annotations
 
+import asyncio
 import random
 from typing import Any
 
@@ -45,24 +46,24 @@ class StickyProxySession:
             await self.http.close()
             self.http = None
         self.session_id = f'{self.name}_{random.randint(0, 1_000_000_000)}'
-        proxy_url = None
+        proxies = None
         if self.proxy_configuration is not None:
             proxy_url = await self.proxy_configuration.new_url(self.session_id)
+            proxies = {'http': proxy_url, 'https': proxy_url}
         profile = random.choice(IMPERSONATE_POOL)
+
+        def _open(impersonate: str) -> AsyncSession:
+            return AsyncSession(
+                proxies=proxies,
+                impersonate=impersonate,
+                max_clients=2,
+                timeout=35,
+            )
+
         try:
-            self.http = AsyncSession(
-                proxy=proxy_url,
-                impersonate=profile,
-                max_clients=2,
-                timeout=35,
-            )
+            self.http = await asyncio.to_thread(_open, profile)
         except Exception:
-            self.http = AsyncSession(
-                proxy=proxy_url,
-                impersonate=DEFAULT_IMPERSONATE,
-                max_clients=2,
-                timeout=35,
-            )
+            self.http = await asyncio.to_thread(_open, DEFAULT_IMPERSONATE)
         self.requests_on_ip = 0
         self.rotations += 1
         if reason != 'start':

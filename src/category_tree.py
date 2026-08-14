@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -30,6 +31,8 @@ class ResolvedCategory:
     subcategory: str
     category_path: str
     url_path: str
+    market_name: str
+    browse_node_id: str | None
 
 
 def normalize_marketplace(code: str) -> str:
@@ -70,6 +73,20 @@ def _find_department(tree: dict, department_name: str) -> dict | None:
 
 
 PATH_SEPARATORS = (' -> ', ' → ', ' > ')
+
+
+def browse_node_id_from_url(url_path: str | None) -> str | None:
+    if not url_path:
+        return None
+    match = re.search(r'(?:[?&]rh=n:|[?&]node=|n:)(\d+)', url_path)
+    return match.group(1) if match else None
+
+
+def _browse_node_id(item: dict) -> str | None:
+    node = item.get('browseNodeId')
+    if node:
+        return str(node)
+    return browse_node_id_from_url(item.get('url'))
 
 
 def format_category_path(department: str, subcategory: str) -> str:
@@ -169,6 +186,8 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
             subcategory=ALL_OPTION,
             category_path=format_category_path(found_department['name'], ALL_OPTION),
             url_path=url_path,
+            market_name=market.name,
+            browse_node_id=_browse_node_id(found_department) or browse_node_id_from_url(url_path),
         )
 
     found_child = _find_child(found_department, child_name)
@@ -187,6 +206,8 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
         subcategory=found_child['name'],
         category_path=format_category_path(found_department['name'], found_child['name']),
         url_path=found_child['url'],
+        market_name=market.name,
+        browse_node_id=_browse_node_id(found_child) or browse_node_id_from_url(found_child.get('url')),
     )
 
 

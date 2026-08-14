@@ -38,7 +38,15 @@ apify run -i '{"marketplace":"IN","category":"Mobiles, Computers -> All Mobile P
 
 Each dataset item is one product:
 
-`asin`, `title`, `url`, `image`, `price`, `originalPrice`, `currency`, `rating`, `reviewsCount`, `isSponsored`, `isPrime`, `badge`, `boughtInPastMonth`, `brand`, `aboutThisItem`, `description`, `productOverview`, `position`, `page`, `marketplace`, `department`, `subcategory`, `categoryPath`
+Listing card: `asin`, `title`, `url`, `image`, `price`, `originalPrice`, `currency`, `rating`, `reviewsCount`, `isSponsored`, `isPrime`, `badge`, `boughtInPastMonth`, `position`, `page`
+
+Details (when `enrichDetails` is on): `brand`, `aboutThisItem`, `description`, `productOverview`, `hasDetails`
+
+Scrape snapshot (on every row, for later analysis): `scrapedAt`, `scrapedDate`, `runId`, `marketplace`, `marketName`, `domain`, `browseNodeId`, `department`, `subcategory`, `categoryPath`, `listingUrl`, `proxyCountry`, `recordType`
+
+`recordType` is `listing` when the category card is stored and `detail` after the product page is fetched. Filter to `recordType=detail` (or `hasDetails=true`) so you do not double-count ASINs in a details run.
+
+The run also writes a `SCRAPE_META` object to the default key-value store: input limits, node id, item counts, `finishedAt`.
 
 Missing values are `null`. `aboutThisItem` is a string list when the product page loaded.
 

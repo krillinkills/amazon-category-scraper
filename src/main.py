@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import datetime, timezone
 from typing import Any
 
 from apify import Actor
@@ -72,9 +73,28 @@ async def main() -> None:
             Actor.log.error(str(error))
             raise
 
+        scraped_at = datetime.now(timezone.utc).replace(microsecond=0)
+        scraped_at_iso = scraped_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+        scraped_date = scraped_at.strftime('%Y-%m-%d')
+        proxy_input = actor_input.get('proxyConfiguration') or {}
+        run_meta = {
+            'scrapedAt': scraped_at_iso,
+            'scrapedDate': scraped_date,
+            'runId': Actor.configuration.actor_run_id,
+            'marketplace': resolved.marketplace,
+            'marketName': resolved.market_name,
+            'domain': resolved.domain,
+            'browseNodeId': resolved.browse_node_id,
+            'department': resolved.department,
+            'subcategory': resolved.subcategory,
+            'categoryPath': resolved.category_path,
+            'proxyCountry': proxy_input.get('apifyProxyCountry'),
+        }
+
         Actor.log.info(
             f'Scraping {resolved.marketplace} {resolved.category_path} '
-            f'on {resolved.domain} (max {max_pages} pages, {max_items} items, '
+            f'on {resolved.domain} node={resolved.browse_node_id} '
+            f'(max {max_pages} pages, {max_items} items, '
             f'details={"on" if enrich_details else "off"}, concurrency={concurrency}, '
             f'sticky IPs rotate every {MAX_REQUESTS_PER_IP} product pages)'
         )
@@ -99,21 +119,24 @@ async def main() -> None:
         detail_fail = 0
         seen: set[str] = set()
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=max(worker_count, 1) * 2)
+        start_gate = asyncio.Semaphore(5)
 
         async def worker(index: int) -> None:
             nonlocal pushed, detail_ok, detail_fail
             sticky = StickyProxySession(
                 proxy_configuration,
-                name=f'pdp-{index}',
+                name=f'pdp{index}',
                 max_requests=MAX_REQUESTS_PER_IP,
             )
-            await sticky.start()
             try:
                 while True:
                     payload = await queue.get()
                     try:
                         if payload is None:
                             return
+                        if sticky.http is None:
+                            async with start_gate:
+                                await sticky.start()
                         record = await _enrich_item(
                             payload,
                             sticky=sticky,
@@ -124,12 +147,20 @@ async def main() -> None:
                             detail_ok += 1
                         else:
                             detail_fail += 1
-                        await Actor.push_data(record)
+                        await Actor.push_data({
+                            **record,
+                            'hasDetails': True,
+                            'recordType': 'detail',
+                        })
                         pushed += 1
+                        if pushed == 1:
+                            Actor.log.info(f'First detailed product written: {record.get("asin")}')
                         if pushed % 25 == 0:
                             Actor.log.info(
                                 f'Enriched {pushed} products ({detail_ok} with details, {detail_fail} listing-only).'
                             )
+                    except Exception as error:
+                        Actor.log.exception(f'pdp{index} failed on {payload.get("asin") if payload else "?"}: {error}')
                     finally:
                         queue.task_done()
             finally:
@@ -138,8 +169,9 @@ async def main() -> None:
         workers = [asyncio.create_task(worker(index)) for index in range(worker_count)]
         if worker_count:
             Actor.log.info(
-                f'Started {worker_count} sticky PDP workers '
-                f'(rotate every {MAX_REQUESTS_PER_IP} requests or on block).'
+                f'{worker_count} detail workers ready '
+                f'(sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
+                'Listing cards are written immediately; brand/About this item follow.'
             )
 
         try:
@@ -182,25 +214,26 @@ async def main() -> None:
                     seen.add(asin)
                     record = {
                         **card,
+                        **EMPTY_PRODUCT_DETAILS,
+                        **run_meta,
                         'url': product_url(resolved.domain, asin),
                         'currency': resolved.currency,
                         'position': position,
                         'page': page,
-                        'marketplace': resolved.marketplace,
-                        'department': resolved.department,
-                        'subcategory': resolved.subcategory,
-                        'categoryPath': resolved.category_path,
+                        'listingUrl': url,
+                        'hasDetails': False,
+                        'recordType': 'listing',
                     }
+                    await Actor.push_data(record)
                     if enrich_details:
                         await queue.put(record)
                     else:
-                        await Actor.push_data(record)
                         pushed += 1
                     queued += 1
                     page_added += 1
 
                 Actor.log.info(
-                    f'Page {page}: {"queued" if enrich_details else "stored"} {page_added} items (total {queued}).'
+                    f'Page {page}: stored {page_added} listing cards (total {queued}).'
                 )
                 if page < max_pages and queued < max_items:
                     await polite_pause()
@@ -210,6 +243,18 @@ async def main() -> None:
             if workers:
                 await asyncio.gather(*workers, return_exceptions=True)
             await listing.close()
+            await Actor.set_value('SCRAPE_META', {
+                **run_meta,
+                'maxPages': max_pages,
+                'maxItems': max_items,
+                'enrichDetails': enrich_details,
+                'maxConcurrency': concurrency,
+                'itemsQueued': queued,
+                'itemsStored': pushed,
+                'detailOk': detail_ok,
+                'detailFail': detail_fail,
+                'finishedAt': datetime.now(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            })
 
         Actor.log.info(
             f'Done. Stored {pushed} products'
