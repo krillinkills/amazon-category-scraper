@@ -2,7 +2,7 @@
     "actorSpecification": 1,
     "name": "amazon-category-scraper",
     "title": "Amazon Category Listing Scraper",
-    "description": "Scrape Amazon category listing cards by marketplace ISO code and All-menu department/subcategory.",
+    "description": "Scrape Amazon category listing cards and product details (brand, About this item) by marketplace and All-menu path.",
     "version": "0.0",
     "buildTag": "latest",
     "meta": {

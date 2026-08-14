@@ -69,6 +69,27 @@ def _find_department(tree: dict, department_name: str) -> dict | None:
     return None
 
 
+PATH_SEPARATORS = (' -> ', ' → ', ' > ')
+
+
+def format_category_path(department: str, subcategory: str) -> str:
+    return f'{department} -> {subcategory}'
+
+
+def parse_category_path(value: str) -> tuple[str, str]:
+    text = _strip_path_prefix(value)
+    for separator in PATH_SEPARATORS:
+        if separator in text:
+            department, subcategory = text.split(separator, 1)
+            department = department.strip()
+            subcategory = subcategory.strip()
+            if department and subcategory:
+                return department, subcategory
+    raise CategoryLookupError(
+        f'Category {value!r} must look like "Department -> Subcategory".'
+    )
+
+
 def _strip_path_prefix(value: str) -> str:
     text = (value or '').strip()
     if ' — ' in text:
@@ -78,9 +99,10 @@ def _strip_path_prefix(value: str) -> str:
 
 def _subcategory_name(department_name: str, raw_subcategory: str) -> str:
     text = _strip_path_prefix(raw_subcategory)
-    prefix = f'{department_name} > '
-    if text.casefold().startswith(prefix.casefold()):
-        text = text[len(prefix):].strip()
+    for separator in PATH_SEPARATORS:
+        prefix = f'{department_name}{separator}'
+        if text.casefold().startswith(prefix.casefold()):
+            return text[len(prefix):].strip()
     return text
 
 
@@ -94,6 +116,19 @@ def _find_child(department: dict, subcategory_name: str) -> dict | None:
         if _norm_name(child['name']) == wanted:
             return child
     return None
+
+
+def resolve_category_input(
+    marketplace: str,
+    category: str | None = None,
+    department: str | None = None,
+    subcategory: str | None = None,
+) -> ResolvedCategory:
+    if category:
+        department, subcategory = parse_category_path(category)
+    if not department or not subcategory:
+        raise CategoryLookupError('Pick a category like "Mobiles, Computers -> All Mobile Phones".')
+    return resolve_category(marketplace, department, subcategory)
 
 
 def resolve_category(marketplace: str, department: str, subcategory: str) -> ResolvedCategory:
@@ -132,7 +167,7 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
             currency=market.currency,
             department=found_department['name'],
             subcategory=ALL_OPTION,
-            category_path=f'{found_department["name"]} > {ALL_OPTION}',
+            category_path=format_category_path(found_department['name'], ALL_OPTION),
             url_path=url_path,
         )
 
@@ -150,7 +185,7 @@ def resolve_category(marketplace: str, department: str, subcategory: str) -> Res
         currency=market.currency,
         department=found_department['name'],
         subcategory=found_child['name'],
-        category_path=f'{found_department["name"]} > {found_child["name"]}',
+        category_path=format_category_path(found_department['name'], found_child['name']),
         url_path=found_child['url'],
     )
 
@@ -162,6 +197,11 @@ def listing_url(resolved: ResolvedCategory, page: int = 1) -> str:
     else:
         url = f'https://{resolved.domain}{path}'
     separator = '&' if '?' in url else '?'
-    if 'page=' in url:
+    extras: list[str] = []
+    if '/s?' in url and 'fs=' not in url:
+        extras.append('fs=true')
+    if 'page=' not in url:
+        extras.append(f'page={page}')
+    if not extras:
         return url
-    return f'{url}{separator}page={page}'
+    return f'{url}{separator}{"&".join(extras)}'

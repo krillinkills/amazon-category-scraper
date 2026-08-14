@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +11,10 @@ CATEGORIES_PATH = ROOT / 'src' / 'categories.json'
 OUT_PATH = ROOT / '.actor' / 'input_schema.json'
 
 ALL_OPTION = '(All)'
+
+
+def category_label(department: str, subcategory: str) -> str:
+    return f'{department} -> {subcategory}'
 
 
 def main() -> None:
@@ -27,44 +30,21 @@ def main() -> None:
         info = markets[lookup]
         marketplace_titles.append(f'{code} — {info["name"]}')
 
-    department_markets: dict[str, set[str]] = defaultdict(set)
-    subcategory_markets: dict[str, set[str]] = defaultdict(set)
-    department_enum: list[str] = []
-    subcategory_enum: list[str] = []
+    category_enum: list[str] = []
+    seen: set[str] = set()
 
-    for iso, tree in categories.items():
+    for tree in categories.values():
         for department in tree.get('departments', []):
             dept_name = department['name']
-            if dept_name not in department_markets:
-                department_enum.append(dept_name)
-            department_markets[dept_name].add(iso)
-
-            all_label = f'{dept_name} > {ALL_OPTION}'
-            if all_label not in subcategory_markets:
-                subcategory_enum.append(all_label)
-            subcategory_markets[all_label].add(iso)
-
+            all_label = category_label(dept_name, ALL_OPTION)
+            if all_label not in seen:
+                seen.add(all_label)
+                category_enum.append(all_label)
             for child in department.get('children', []):
-                label = f'{dept_name} > {child["name"]}'
-                if label not in subcategory_markets:
-                    subcategory_enum.append(label)
-                subcategory_markets[label].add(iso)
-
-    department_titles = []
-    for name in department_enum:
-        isos = sorted(department_markets[name])
-        if len(isos) > 1:
-            department_titles.append(f'{name} ({", ".join(isos)})')
-        else:
-            department_titles.append(f'{isos[0]} — {name}')
-
-    subcategory_titles = []
-    for label in subcategory_enum:
-        isos = sorted(subcategory_markets[label])
-        if len(isos) > 1:
-            subcategory_titles.append(f'{label} ({", ".join(isos)})')
-        else:
-            subcategory_titles.append(f'{isos[0]} — {label}')
+                label = category_label(dept_name, child['name'])
+                if label not in seen:
+                    seen.add(label)
+                    category_enum.append(label)
 
     schema = {
         'title': 'Amazon Category Listing Scraper',
@@ -80,33 +60,26 @@ def main() -> None:
                 'enumTitles': marketplace_titles,
                 'default': 'IN',
             },
-            'department': {
-                'title': 'Department',
-                'type': 'string',
-                'description': 'Amazon All → Shop by Category parent, using the same name Amazon shows.',
-                'editor': 'select',
-                'enum': department_enum,
-                'enumTitles': department_titles,
-            },
-            'subcategory': {
-                'title': 'Subcategory',
+            'category': {
+                'title': 'Category',
                 'type': 'string',
                 'description': (
-                    'Every child under the All menu. Labels are Department > Subcategory. '
-                    f'Pick "{ALL_OPTION}" to scrape the whole department. '
-                    'The pair must exist for the selected marketplace.'
+                    'One All-menu path: Department -> Subcategory. '
+                    f'Pick "Department -> {ALL_OPTION}" to scrape the whole department. '
+                    'The path must exist for the selected marketplace.'
                 ),
                 'editor': 'select',
-                'enum': subcategory_enum,
-                'enumTitles': subcategory_titles,
+                'enum': category_enum,
+                'enumTitles': category_enum,
             },
             'maxPages': {
-                'title': 'Max pages',
+                'title': 'Pages to scrape',
                 'type': 'integer',
-                'description': 'Maximum listing pages to fetch. Amazon usually stops around 20.',
+                'description': 'How many Amazon listing pages to fetch. Set this yourself (1–20). Amazon usually stops after about 20 pages.',
                 'minimum': 1,
                 'maximum': 20,
-                'default': 3,
+                'prefill': 5,
+                'sectionCaption': 'How much to scrape',
             },
             'maxItems': {
                 'title': 'Max items',
@@ -114,7 +87,25 @@ def main() -> None:
                 'description': 'Stop after this many product cards.',
                 'minimum': 1,
                 'maximum': 1000,
-                'default': 60,
+                'default': 1000,
+            },
+            'enrichDetails': {
+                'title': 'Fetch product details',
+                'type': 'boolean',
+                'description': (
+                    'Open each product page for brand, About this item, description, and overview. '
+                    'Listing-card fields are still saved if a detail page fails.'
+                ),
+                'default': True,
+                'sectionCaption': 'Product details',
+            },
+            'maxConcurrency': {
+                'title': 'Detail-page concurrency',
+                'type': 'integer',
+                'description': 'How many product pages to fetch at once. Each request uses its own proxy IP. Default 50.',
+                'minimum': 1,
+                'maximum': 50,
+                'default': 50,
             },
             'proxyConfiguration': {
                 'title': 'Proxy',
@@ -125,15 +116,11 @@ def main() -> None:
                 'default': {'useApifyProxy': True},
             },
         },
-        'required': ['marketplace', 'department', 'subcategory'],
+        'required': ['marketplace', 'category', 'maxPages'],
     }
 
     OUT_PATH.write_text(json.dumps(schema, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-    print(
-        f'Wrote {OUT_PATH} '
-        f'({len(marketplace_enum)} markets, {len(department_enum)} departments, '
-        f'{len(subcategory_enum)} subcategory options)'
-    )
+    print(f'Wrote {OUT_PATH} ({len(marketplace_enum)} markets, {len(category_enum)} category paths)')
 
 
 if __name__ == '__main__':
