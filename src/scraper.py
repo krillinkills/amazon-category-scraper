@@ -62,6 +62,10 @@ EMPTY_PRODUCT_DETAILS = {
     'aboutThisItem': None,
     'description': None,
     'productOverview': None,
+    'productCategory': None,
+    'productCategories': None,
+    'productCategoryPath': None,
+    'productBrowseNodeId': None,
 }
 
 
@@ -370,10 +374,85 @@ def _about_this_item(soup: BeautifulSoup) -> list[str]:
     return bullets
 
 
+def _browse_node_id(href: str | None) -> str | None:
+    if not href:
+        return None
+    match = re.search(r'[?&]node=(\d+)', href)
+    return match.group(1) if match else None
+
+
+def _skip_crumb_name(name: str) -> bool:
+    lowered = name.casefold()
+    return lowered in {'›', '>', '/', 'amazon', 'amazon.in', 'amazon.com'} or lowered.startswith('amazon.')
+
+
+def _crumbs_from_wayfinding(soup: BeautifulSoup) -> list[dict[str, str | None]]:
+    crumbs: list[dict[str, str | None]] = []
+    for link in soup.select(
+        '#wayfinding-breadcrumbs_feature_div a, '
+        '#wayfinding-breadcrumbs_container a'
+    ):
+        name = _text(link)
+        if not name or _skip_crumb_name(name):
+            continue
+        crumbs.append({
+            'name': name,
+            'browseNodeId': _browse_node_id(link.get('href')),
+        })
+    return crumbs
+
+
+def _crumbs_from_json_ld(node: dict) -> list[dict[str, str | None]]:
+    types = node.get('@type')
+    type_names = types if isinstance(types, list) else [types]
+    if 'BreadcrumbList' not in {name for name in type_names if name}:
+        return []
+    elements = node.get('itemListElement') or []
+    if not isinstance(elements, list):
+        return []
+    ordered: list[tuple[int, dict[str, str | None]]] = []
+    for item in elements:
+        if not isinstance(item, dict):
+            continue
+        name = item.get('name')
+        url = item.get('item')
+        if isinstance(url, dict):
+            name = name or url.get('name')
+            url = url.get('@id') or url.get('url') or url.get('item')
+        if not isinstance(name, str):
+            continue
+        name = re.sub(r'\s+', ' ', name).strip()
+        if not name or _skip_crumb_name(name):
+            continue
+        position = item.get('position')
+        try:
+            rank = int(position)
+        except (TypeError, ValueError):
+            rank = len(ordered)
+        ordered.append((rank, {
+            'name': name,
+            'browseNodeId': _browse_node_id(url if isinstance(url, str) else None),
+        }))
+    ordered.sort(key=lambda pair: pair[0])
+    return [crumb for _, crumb in ordered]
+
+
+def _product_category_fields(crumbs: list[dict[str, str | None]]) -> dict[str, Any]:
+    names = [crumb['name'] for crumb in crumbs if crumb.get('name')]
+    leaf = crumbs[-1] if crumbs else None
+    return {
+        'productCategory': leaf['name'] if leaf else None,
+        'productCategories': names or None,
+        'productCategoryPath': ' > '.join(names) if names else None,
+        'productBrowseNodeId': leaf.get('browseNodeId') if leaf else None,
+    }
+
+
 def parse_product_detail(html: str) -> dict[str, Any]:
     soup = BeautifulSoup(html, 'lxml')
     brand = None
     description = None
+    crumbs = _crumbs_from_wayfinding(soup)
 
     for script in soup.select('script[type="application/ld+json"]'):
         raw = script.string or script.get_text() or ''
@@ -385,6 +464,8 @@ def parse_product_detail(html: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         for node in _walk_json_ld(payload):
+            if not crumbs:
+                crumbs = _crumbs_from_json_ld(node)
             types = node.get('@type')
             type_names = types if isinstance(types, list) else [types]
             if not any(name in {'Product', 'IndividualProduct'} for name in type_names if name):
@@ -419,6 +500,7 @@ def parse_product_detail(html: str) -> dict[str, Any]:
         'aboutThisItem': about or [],
         'description': description,
         'productOverview': overview,
+        **_product_category_fields(crumbs),
     }
 
 

@@ -40,7 +40,9 @@ Each dataset item is one product:
 
 Listing card: `asin`, `title`, `url`, `image`, `price`, `originalPrice`, `currency`, `rating`, `reviewsCount`, `isSponsored`, `isPrime`, `badge`, `boughtInPastMonth`, `position`, `page`
 
-Details (when `enrichDetails` is on): `brand`, `aboutThisItem`, `description`, `productOverview`, `hasDetails`
+Details (when `enrichDetails` is on): `brand`, `aboutThisItem`, `description`, `productOverview`, `productCategory`, `productCategories`, `productCategoryPath`, `productBrowseNodeId`, `hasDetails`
+
+`department` / `subcategory` / `categoryPath` stay the All-menu path you scraped. The product-page breadcrumb is stored separately, e.g. `Home Improvement > Kitchen & Bath Fixtures > Bathroom Fixtures > Showers > Showerhead Filters`.
 
 Scrape snapshot (on every row, for later analysis): `scrapedAt`, `scrapedDate`, `runId`, `marketplace`, `marketName`, `domain`, `browseNodeId`, `department`, `subcategory`, `categoryPath`, `listingUrl`, `proxyCountry`, `recordType`
 
