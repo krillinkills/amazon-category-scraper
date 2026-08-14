@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from bs4 import BeautifulSoup
+from curl_cffi import CurlOpt
 from curl_cffi.requests import AsyncSession
 
 ROBOT_MARKERS = (
@@ -68,6 +69,38 @@ EMPTY_PRODUCT_DETAILS = {
     'productBrowseNodeId': None,
 }
 
+REQUEST_TIMEOUT = 18
+LOW_SPEED_LIMIT_BYTES = 2_000
+LOW_SPEED_TIME_SECONDS = 8
+
+# Drop everything after the product block. Reviews / A+ / recs are huge and unused.
+PDP_CUT_MARKERS = (
+    'id="aplus"',
+    "id='aplus'",
+    'id="aplus_feature_div"',
+    'id="dpx-aplus-product-description_feature_div"',
+    'id="reviewsMedley"',
+    'id="customerReviews"',
+    'id="rhf"',
+    'id="similarities_feature_div"',
+    'id="purchase-similarities_feature_div"',
+)
+LISTING_CUT_MARKERS = (
+    'id="rhf"',
+    'id="navFooter"',
+)
+
+
+def has_product_details(details: dict[str, Any]) -> bool:
+    about = details.get('aboutThisItem')
+    return bool(
+        details.get('brand')
+        or details.get('description')
+        or details.get('productCategoryPath')
+        or details.get('productOverview')
+        or (isinstance(about, list) and about)
+    )
+
 
 class AmazonBlockedError(RuntimeError):
     """Amazon returned a robot check or an empty blocked page."""
@@ -92,9 +125,95 @@ def product_url(domain: str, asin: str) -> str:
     return f'https://{domain}/dp/{asin}'
 
 
+def product_fetch_url(domain: str, asin: str) -> str:
+    """Canonical /dp URL plus variation flags so Amazon skips the parent picker."""
+    return f'https://{domain}/dp/{asin}?th=1&psc=1'
+
+
 def _is_blocked(html: str) -> bool:
     lowered = html.casefold()
     return any(marker.casefold() in lowered for marker in ROBOT_MARKERS)
+
+
+def _strip_elements(html: str, tag: str, *, keep_if: str | None = None) -> str:
+    """Remove <tag>...</tag> blocks without a DOTALL regex over megabyte pages."""
+    open_tag = f'<{tag}'
+    close_tag = f'</{tag}>'
+    close_len = len(close_tag)
+    parts: list[str] = []
+    pos = 0
+    while True:
+        start = html.find(open_tag, pos)
+        if start == -1:
+            parts.append(html[pos:])
+            break
+        gt = html.find('>', start)
+        if gt == -1:
+            parts.append(html[pos:])
+            break
+        opening = html[start:gt + 1]
+        end = html.find(close_tag, gt)
+        if keep_if and keep_if in opening.casefold():
+            if end == -1:
+                parts.append(html[pos:])
+                break
+            parts.append(html[pos:end + close_len])
+            pos = end + close_len
+            continue
+        parts.append(html[pos:start])
+        pos = end + close_len if end != -1 else gt + 1
+    return ''.join(parts)
+
+
+# Prefer to cut only after these product fields so a head/JSON-LD mention cannot
+# truncate the page before brand / bullets / description.
+PDP_KEEP_MARKERS = (
+    'id="feature-bullets"',
+    'id="featurebullets_feature_div"',
+    'id="productFactsDesktopExpander"',
+    'id="productOverview_feature_div"',
+    'id="productDescription"',
+    'id="wayfinding-breadcrumbs_feature_div"',
+    'application/ld+json',
+)
+
+
+def _cut_after_markers(
+    html: str,
+    markers: tuple[str, ...],
+    *,
+    after: tuple[str, ...] = (),
+) -> str:
+    floor = 0
+    for token in after:
+        idx = html.find(token)
+        if idx != -1:
+            floor = max(floor, idx)
+    cut_at: int | None = None
+    for marker in markers:
+        idx = html.find(marker)
+        if idx != -1 and idx > floor and (cut_at is None or idx < cut_at):
+            cut_at = idx
+    if cut_at is None:
+        return html
+    return html[:cut_at]
+
+
+def thin_product_html(html: str) -> str:
+    """Keep JSON-LD + product markup; drop JS bundles, CSS, SVG, reviews, A+."""
+    html = _strip_elements(html, 'script', keep_if='ld+json')
+    html = _strip_elements(html, 'style')
+    html = _strip_elements(html, 'svg')
+    html = _strip_elements(html, 'noscript')
+    return _cut_after_markers(html, PDP_CUT_MARKERS, after=PDP_KEEP_MARKERS)
+
+
+def thin_listing_html(html: str) -> str:
+    html = _strip_elements(html, 'script', keep_if='ld+json')
+    html = _strip_elements(html, 'style')
+    html = _strip_elements(html, 'svg')
+    html = _strip_elements(html, 'noscript')
+    return _cut_after_markers(html, LISTING_CUT_MARKERS, after=('data-component-type="s-search-result"',))
 
 
 def create_session(
@@ -105,7 +224,11 @@ def create_session(
     kwargs: dict[str, Any] = {
         'impersonate': impersonate,
         'max_clients': max_clients,
-        'timeout': 35,
+        'timeout': REQUEST_TIMEOUT,
+        'curl_options': {
+            CurlOpt.LOW_SPEED_LIMIT: LOW_SPEED_LIMIT_BYTES,
+            CurlOpt.LOW_SPEED_TIME: LOW_SPEED_TIME_SECONDS,
+        },
     }
     if proxy_url:
         kwargs['proxies'] = {'http': proxy_url, 'https': proxy_url}
@@ -115,7 +238,7 @@ def create_session(
 async def fetch_html(
     url: str,
     proxy_url: str | None = None,
-    timeout: int = 35,
+    timeout: int = REQUEST_TIMEOUT,
     session: AsyncSession | None = None,
     headers: dict[str, str] | None = None,
 ) -> str:
@@ -200,7 +323,7 @@ def _parse_int(raw: str | None) -> int | None:
 
 
 def parse_listing_cards(html: str, domain: str) -> list[dict[str, Any]]:
-    soup = BeautifulSoup(html, 'lxml')
+    soup = BeautifulSoup(thin_listing_html(html), 'lxml')
     cards = soup.select('div[data-component-type="s-search-result"][data-asin]')
     if not cards:
         cards = [
@@ -342,11 +465,16 @@ def _product_overview(soup: BeautifulSoup) -> dict[str, str] | None:
         '#productOverview_feature_div tr, '
         'table.a-normal.a-spacing-micro tr, '
         '#productDetails_techSpec_section_1 tr, '
-        '#productDetails_detailBullets_sections1 tr'
+        '#productDetails_detailBullets_sections1 tr, '
+        '#productFactsDesktopExpander tr, '
+        '#productFactsDesktop_feature_div tr, '
+        '#tech-specs-desktop tr'
     )
     for row in rows:
         key = _text(row.select_one('th, td.a-span3, span.a-text-bold, span.a-color-secondary'))
-        value = _text(row.select_one('td.po-break-word, td.a-span9, td:last-child'))
+        value = _text(row.select_one(
+            'td.po-break-word, span.po-break-word, td.a-span9, td:last-child'
+        ))
         if not key or not value or key == value:
             continue
         key = key.rstrip(':').strip()
@@ -361,7 +489,11 @@ def _about_this_item(soup: BeautifulSoup) -> list[str]:
     nodes = soup.select(
         '#feature-bullets ul li span.a-list-item, '
         '#featurebullets_feature_div li span.a-list-item, '
-        '#feature-bullets li'
+        '#feature-bullets li, '
+        '#productFactsDesktopExpander li, '
+        '#productFactsDesktop_feature_div li, '
+        '#productFactsDesktopExpander .a-list-item, '
+        '#featurebullets_feature_div li'
     )
     for node in nodes:
         text = _text(node)
@@ -390,7 +522,8 @@ def _crumbs_from_wayfinding(soup: BeautifulSoup) -> list[dict[str, str | None]]:
     crumbs: list[dict[str, str | None]] = []
     for link in soup.select(
         '#wayfinding-breadcrumbs_feature_div a, '
-        '#wayfinding-breadcrumbs_container a'
+        '#wayfinding-breadcrumbs_container a, '
+        'div.a-breadcrumb a'
     ):
         name = _text(link)
         if not name or _skip_crumb_name(name):
@@ -449,7 +582,7 @@ def _product_category_fields(crumbs: list[dict[str, str | None]]) -> dict[str, A
 
 
 def parse_product_detail(html: str) -> dict[str, Any]:
-    soup = BeautifulSoup(html, 'lxml')
+    soup = BeautifulSoup(thin_product_html(html), 'lxml')
     brand = None
     description = None
     crumbs = _crumbs_from_wayfinding(soup)
@@ -480,8 +613,12 @@ def parse_product_detail(html: str) -> dict[str, Any]:
         brand = _clean_brand(_first_text(soup, [
             '#bylineInfo',
             'a#bylineInfo',
+            '#bylineInfo_feature_div #bylineInfo',
             'tr.po-brand span.po-break-word',
+            '#productOverview_feature_div tr.po-brand span.po-break-word',
             '#productOverview_feature_div tr.po-brand td.po-break-word',
+            '#productFactsDesktopExpander tr.po-brand td.po-break-word',
+            'a#brand',
         ]))
 
     overview = _product_overview(soup)
@@ -492,7 +629,9 @@ def parse_product_detail(html: str) -> dict[str, Any]:
                 break
 
     if not description:
-        description = _text(soup.select_one('#productDescription, #productDescription p'))
+        description = _text(soup.select_one(
+            '#productDescription, #productDescription p, #productDescription_feature_div'
+        ))
 
     about = _about_this_item(soup)
     return {
@@ -504,5 +643,5 @@ def parse_product_detail(html: str) -> dict[str, Any]:
     }
 
 
-async def polite_pause(minimum: float = 2.0, maximum: float = 4.5) -> None:
+async def polite_pause(minimum: float = 0.2, maximum: float = 0.6) -> None:
     await asyncio.sleep(random.uniform(minimum, maximum))

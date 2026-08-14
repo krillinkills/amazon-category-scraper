@@ -2453,10 +2453,10 @@
     "maxConcurrency": {
       "title": "Detail-page concurrency",
       "type": "integer",
-      "description": "How many product pages to fetch at once. Each worker keeps a sticky residential IP and rotates it after about 25 pages or on a block. Default 50.",
+      "description": "How many product pages to fetch at once. Each worker keeps a sticky residential IP and rotates it after about 25 pages or on a block. Default 100, max 150.",
       "minimum": 1,
-      "maximum": 100,
-      "default": 50
+      "maximum": 150,
+      "default": 100
     },
     "proxyConfiguration": {
       "title": "Proxy",

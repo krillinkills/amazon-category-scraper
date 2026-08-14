@@ -13,14 +13,14 @@ You pick a marketplace ISO code and one All-menu path: `Department -> Subcategor
 | `maxPages` or `pages` | Optional. How many listing pages to fetch. `0` or omit = no page limit. |
 | `maxItems` | Optional. `0` or omit = no item limit. |
 | `enrichDetails` | Default `true`. Fetch brand / About this item from each `/dp/ASIN` page. |
-| `maxConcurrency` | Default `50`. Worker pool size. Each worker keeps a sticky residential IP and rotates it after ~25 product pages or on a block. |
+| `maxConcurrency` | Default `100`. Worker pool size, cap `150`. Each worker keeps a sticky residential IP and rotates it after ~25 product pages or on a block. |
 | `proxyConfiguration` | Apify proxy. Residential is recommended. |
 
 The Console has a single Category dropdown. Labels are `Department -> Subcategory` with no marketplace codes.
 
 The path must exist for that marketplace. A mismatch fails and lists the valid children.
 
-Listing pages stay sequential on one sticky IP (rotated every 10 pages or on a 503). Product-detail fetches run in a 50-wide pool: each worker reuses one residential IP, then rotates on captcha/timeout or after 25 products. A details run stores one row per ASIN after `/dp` is fetched. A failed detail page still stores that one row with listing fields and empty detail columns. Set `enrichDetails` to `false` to store listing cards only.
+Runs in two phases. Phase 1 walks every listing page on one sticky IP (rotated every 15 pages or on a 503) and collects unique product cards. Phase 2 then opens each `/dp` page in a 100-wide pool: each worker reuses one residential IP and rotates on captcha/timeout or after 25 products. Product HTML is stripped of scripts, CSS, and reviews before parsing. Stalled proxy downloads abort after ~8s of under 2 KB/s instead of waiting 35s. A details run stores one row per ASIN after `/dp` is fetched, and only if brand, About this item, description, overview, or the product breadcrumb parsed. Failed detail pages are skipped, not stored as empty rows. Set `enrichDetails` to `false` to store listing cards only.
 
 ## Example
 

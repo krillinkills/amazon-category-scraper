@@ -14,12 +14,27 @@ from typing import Any
 from apify import Actor
 from curl_cffi.requests import AsyncSession
 
-from .scraper import AmazonBlockedError, AmazonRetryableError, fetch_html, polite_pause
+from .scraper import (
+    AmazonBlockedError,
+    AmazonRetryableError,
+    create_session,
+    fetch_html,
+    polite_pause,
+)
 
-IMPERSONATE_POOL = ('chrome', 'chrome116', 'chrome119', 'chrome120', 'edge101', 'safari15_5')
+IMPERSONATE_POOL = (
+    'chrome',
+    'chrome131',
+    'chrome136',
+    'chrome146',
+    'chrome131_android',
+    'safari184',
+    'safari184_ios',
+    'edge101',
+)
 DEFAULT_IMPERSONATE = 'chrome'
 MAX_REQUESTS_PER_IP = 25
-LISTING_REQUESTS_PER_IP = 10
+LISTING_REQUESTS_PER_IP = 15
 
 
 class StickyProxySession:
@@ -46,19 +61,13 @@ class StickyProxySession:
             await self.http.close()
             self.http = None
         self.session_id = f'{self.name}_{random.randint(0, 1_000_000_000)}'
-        proxies = None
+        proxy_url = None
         if self.proxy_configuration is not None:
             proxy_url = await self.proxy_configuration.new_url(self.session_id)
-            proxies = {'http': proxy_url, 'https': proxy_url}
         profile = random.choice(IMPERSONATE_POOL)
 
         def _open(impersonate: str) -> AsyncSession:
-            return AsyncSession(
-                proxies=proxies,
-                impersonate=impersonate,
-                max_clients=2,
-                timeout=35,
-            )
+            return create_session(max_clients=2, proxy_url=proxy_url, impersonate=impersonate)
 
         try:
             self.http = await asyncio.to_thread(_open, profile)
@@ -97,7 +106,10 @@ class StickyProxySession:
                 )
                 await self.rotate(f'{type(error).__name__} on attempt {attempt}')
                 if attempt < attempts:
-                    await polite_pause(1.2, 2.8)
+                    if isinstance(error, AmazonBlockedError):
+                        await polite_pause(0.6, 1.4)
+                    else:
+                        await polite_pause(0.15, 0.5)
         return None, last_error
 
     async def close(self) -> None:
