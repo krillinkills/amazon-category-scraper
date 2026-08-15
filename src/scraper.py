@@ -78,6 +78,15 @@ EMPTY_PRODUCT_DETAILS = {
 REQUEST_TIMEOUT = 18
 LOW_SPEED_LIMIT_BYTES = 2_000
 LOW_SPEED_TIME_SECONDS = 8
+PDP_MAX_BYTES = 400_000
+PDP_EXTRA_AFTER_KEEP = 100_000
+LISTING_MAX_BYTES = 220_000
+STREAM_BLOCK_MARKERS = (
+    'validateCaptcha',
+    'enter the characters you see below',
+    'sorry, we just need to make sure you',
+    'automated access to amazon',
+)
 
 # Drop everything after the product block. Reviews / A+ / recs are huge and unused.
 PDP_CUT_MARKERS = (
@@ -248,24 +257,56 @@ def thin_listing_html(html: str) -> str:
 
 
 class _EarlyAbortBuffer:
-    """Collect HTML and tell curl to hang up once the product block is in."""
+    """Collect HTML and hang up after the product block, a byte cap, or a robot page."""
 
-    def __init__(self, cut: tuple[str, ...], require: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        cut: tuple[str, ...] = (),
+        require: tuple[str, ...] = (),
+        *,
+        max_bytes: int | None = None,
+        extra_after_keep: int | None = None,
+        block_markers: tuple[str, ...] = STREAM_BLOCK_MARKERS,
+    ) -> None:
         self.cut = cut
         self.require = require
+        self.max_bytes = max_bytes
+        self.extra_after_keep = extra_after_keep
+        self.block_markers = block_markers
         self.chunks: list[bytes] = []
         self.aborted = False
-        self._found_keep = False
+        self.blocked = False
+        self._found_keep = not require
+        self._keep_at: int | None = 0 if not require else None
+        self._size = 0
         self._tail = ''
-        self._overlap = max(len(token) for token in cut + require)
+        tokens = cut + require + block_markers
+        self._overlap = max((len(token) for token in tokens), default=32)
 
     def __call__(self, chunk: bytes) -> int:
         self.chunks.append(chunk)
+        self._size += len(chunk)
         piece = chunk.decode('latin-1')
         haystack = self._tail + piece
-        if not self._found_keep:
-            self._found_keep = any(token in haystack for token in self.require)
-        if self._found_keep and any(token in haystack for token in self.cut):
+        if self.block_markers and any(token in haystack for token in self.block_markers):
+            self.blocked = True
+            self.aborted = True
+            return CURL_WRITEFUNC_ERROR
+        if not self._found_keep and any(token in haystack for token in self.require):
+            self._found_keep = True
+            self._keep_at = self._size
+        if self._found_keep and self.cut and any(token in haystack for token in self.cut):
+            self.aborted = True
+            return CURL_WRITEFUNC_ERROR
+        if (
+            self._found_keep
+            and self.extra_after_keep is not None
+            and self._keep_at is not None
+            and self._size - self._keep_at >= self.extra_after_keep
+        ):
+            self.aborted = True
+            return CURL_WRITEFUNC_ERROR
+        if self.max_bytes is not None and self._size >= self.max_bytes:
             self.aborted = True
             return CURL_WRITEFUNC_ERROR
         self._tail = haystack[-self._overlap:]
@@ -303,13 +344,21 @@ async def fetch_html(
     *,
     abort_after: tuple[str, ...] | None = None,
     abort_requires: tuple[str, ...] | None = None,
+    max_bytes: int | None = None,
+    extra_after_keep: int | None = None,
 ) -> str:
     owns_session = session is None
     if session is None:
         session = create_session(max_clients=1, proxy_url=proxy_url)
+    use_abort = bool(abort_after and abort_requires) or max_bytes is not None
     abort_buf = (
-        _EarlyAbortBuffer(abort_after, abort_requires)
-        if abort_after and abort_requires
+        _EarlyAbortBuffer(
+            abort_after or (),
+            abort_requires or (),
+            max_bytes=max_bytes,
+            extra_after_keep=extra_after_keep,
+        )
+        if use_abort
         else None
     )
     try:
@@ -339,6 +388,8 @@ async def fetch_html(
         except Exception as error:
             raise AmazonRetryableError(f'Request failed for {url}: {error}') from error
 
+        if abort_buf is not None and abort_buf.blocked:
+            raise AmazonBlockedError(f'Amazon robot check on {url}')
         if status in {429, 500, 502, 503, 504}:
             raise AmazonRetryableError(f'HTTP {status} on {url}')
         if status >= 400:

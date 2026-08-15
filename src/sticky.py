@@ -61,7 +61,7 @@ class StickyProxySession:
         self.http: AsyncSession | None = None
         self.requests_on_ip = 0
         self.rotations = 0
-        self._warmed = False
+        self.bytes_downloaded = 0
 
     async def start(self) -> None:
         await self.rotate('start')
@@ -85,22 +85,8 @@ class StickyProxySession:
             self.http = await asyncio.to_thread(_open, DEFAULT_IMPERSONATE)
         self.requests_on_ip = 0
         self.rotations += 1
-        self._warmed = False
         if reason != 'start':
             Actor.log.info(f'Rotated sticky IP {self.name} -> {self.session_id} ({reason})')
-
-    async def _warmup(self, headers: dict[str, str]) -> None:
-        if self._warmed or not self.origin or self.http is None:
-            return
-        try:
-            await fetch_html(f'{self.origin}/', session=self.http, headers=headers)
-        except (AmazonBlockedError, AmazonRetryableError) as error:
-            # US CloudFront often 503s the first hit while setting session cookies.
-            Actor.log.info(f'{self.name} homepage warmup got {error}; keeping IP for listing')
-        except Exception as error:
-            Actor.log.warning(f'{self.name} homepage warmup failed: {error}')
-        self.requests_on_ip += 1
-        self._warmed = True
 
     async def fetch(
         self,
@@ -113,8 +99,6 @@ class StickyProxySession:
         if self.requests_on_ip >= self.max_requests:
             await self.rotate(f'proactive after {self.requests_on_ip} requests')
         assert self.http is not None
-        if not self._warmed and self.origin:
-            await self._warmup(headers)
         try:
             html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
         except AmazonRetryableError as error:
@@ -123,6 +107,7 @@ class StickyProxySession:
             Actor.log.info(f'{self.name} {error}; retrying once on the same IP')
             html = await fetch_html(url, session=self.http, headers=headers, **fetch_kwargs)
         self.requests_on_ip += 1
+        self.bytes_downloaded += len(html)
         return html
 
     async def fetch_with_retries(

@@ -115,11 +115,12 @@ def main() -> None:
                 'type': 'integer',
                 'description': (
                     'How many product pages to fetch at once. Each worker keeps a sticky residential IP '
-                    'and rotates it after about 25 pages or on a block. Default 100, max 150.'
+                    'and rotates it after about 25 pages or on a block. Default 20, max 80. '
+                    'Higher values burn more proxy GB on Amazon.com robot checks.'
                 ),
                 'minimum': 1,
-                'maximum': 150,
-                'default': 100,
+                'maximum': 80,
+                'default': 20,
             },
             'proxyConfiguration': {
                 'title': 'Proxy',

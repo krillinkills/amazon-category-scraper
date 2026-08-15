@@ -13,8 +13,12 @@ from .category_tree import (
 )
 from .scraper import (
     EMPTY_PRODUCT_DETAILS,
+    LISTING_CUT_MARKERS,
+    LISTING_MAX_BYTES,
     PDP_CUT_MARKERS,
+    PDP_EXTRA_AFTER_KEEP,
     PDP_KEEP_MARKERS,
+    PDP_MAX_BYTES,
     AmazonBlockedError,
     AmazonRetryableError,
     has_core_details,
@@ -36,8 +40,8 @@ from .sticky import (
 )
 
 
-DEFAULT_CONCURRENCY = 100
-MAX_CONCURRENCY = 150
+DEFAULT_CONCURRENCY = 20
+MAX_CONCURRENCY = 80
 DETAIL_QUEUE_MAX = 200
 
 
@@ -142,7 +146,12 @@ async def _collect_listing(
                 if attempt > 1:
                     Actor.log.info(f'Listing page {page} trying {url}')
             html, last_error = await listing.fetch_with_retries(
-                url, listing_headers, attempts=1,
+                url,
+                listing_headers,
+                attempts=1,
+                abort_after=LISTING_CUT_MARKERS,
+                abort_requires=('data-component-type="s-search-result"',),
+                max_bytes=LISTING_MAX_BYTES,
             )
             if html:
                 cards = await asyncio.to_thread(parse_listing_cards, html, resolved.domain)
@@ -215,12 +224,15 @@ async def _enrich_item(
 ) -> dict[str, Any] | None:
     url = product_fetch_url(domain, item['asin'])
     last_error: Exception | None = None
-    abort_kwargs: dict[str, Any] = {}
+    abort_kwargs: dict[str, Any] = {
+        'max_bytes': PDP_MAX_BYTES,
+    }
     if abort_after_product_block:
-        abort_kwargs = {
+        abort_kwargs.update({
             'abort_after': PDP_CUT_MARKERS,
             'abort_requires': PDP_KEEP_MARKERS,
-        }
+            'extra_after_keep': PDP_EXTRA_AFTER_KEEP,
+        })
     for attempt in range(1, attempts + 1):
         try:
             html = await sticky.fetch(url, headers, **abort_kwargs)
@@ -279,6 +291,7 @@ async def _run_detail_pipeline(
     pushed = 0
     missed = 0
     queued = 0
+    pdp_bytes = 0
     pass_name = 'pass1'
 
     async def enqueue(record: dict[str, Any]) -> None:
@@ -289,7 +302,7 @@ async def _run_detail_pipeline(
         queued += 1
 
     async def worker(index: int) -> None:
-        nonlocal pushed, missed
+        nonlocal pushed, missed, pdp_bytes
         sticky = StickyProxySession(
             proxy_configuration,
             name=f'pdp{index}',
@@ -308,7 +321,7 @@ async def _run_detail_pipeline(
                     if sticky.http is None:
                         async with start_gate:
                             await sticky.start()
-                    attempts = 2 if pass_name == 'pass1' else 3
+                    attempts = 1 if pass_name == 'pass1' else 2
                     record = await _enrich_item(
                         payload,
                         sticky=sticky,
@@ -357,6 +370,7 @@ async def _run_detail_pipeline(
                 finally:
                     queue.task_done()
         finally:
+            pdp_bytes += sticky.bytes_downloaded
             await sticky.close()
 
     workers = [asyncio.create_task(worker(index)) for index in range(concurrency)]
@@ -367,6 +381,7 @@ async def _run_detail_pipeline(
         'Rows are stored only when brand, About this item, or overview parsed.'
     )
     listing_pages = 0
+    listing_bytes = 0
     try:
         try:
             _, listing_pages = await _collect_listing(
@@ -380,6 +395,7 @@ async def _run_detail_pipeline(
                 stop=stop,
             )
         finally:
+            listing_bytes = listing.bytes_downloaded
             await listing.close()
         Actor.log.info(
             f'Listing finished: {queued} unique ASINs from {listing_pages} pages. '
@@ -410,6 +426,13 @@ async def _run_detail_pipeline(
             worker_task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         raise
+    html_mb = (listing_bytes + pdp_bytes) / (1024 * 1024)
+    Actor.log.info(
+        f'Downloaded ~{html_mb:.1f} MB HTML '
+        f'(listing {listing_bytes / (1024 * 1024):.1f} MB, '
+        f'product pages {pdp_bytes / (1024 * 1024):.1f} MB). '
+        'Residential proxy bills this transfer at about $7.50/GB.'
+    )
     return pushed, missed, queued, listing_pages
 
 
