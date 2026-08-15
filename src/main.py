@@ -14,7 +14,6 @@ from .category_tree import (
 from .scraper import (
     EMPTY_PRODUCT_DETAILS,
     LISTING_CUT_MARKERS,
-    LISTING_MAX_BYTES,
     PDP_CUT_MARKERS,
     PDP_EXTRA_AFTER_KEEP,
     PDP_KEEP_MARKERS,
@@ -40,7 +39,7 @@ from .sticky import (
 )
 
 
-DEFAULT_CONCURRENCY = 20
+DEFAULT_CONCURRENCY = 48
 MAX_CONCURRENCY = 80
 DETAIL_QUEUE_MAX = 200
 
@@ -114,9 +113,10 @@ async def _collect_listing(
     max_pages: int | None,
     max_items: int | None,
     on_item: Any | None = None,
+    on_page: Any | None = None,
     stop: asyncio.Event | None = None,
 ) -> tuple[int, int]:
-    """Walk listing pages. Yields cards via on_item. Returns (yielded, pages)."""
+    """Walk listing pages. Yields cards via on_item / on_page. Returns (yielded, pages)."""
     yielded = 0
     seen: set[str] = set()
     page = 0
@@ -151,7 +151,6 @@ async def _collect_listing(
                 attempts=1,
                 abort_after=LISTING_CUT_MARKERS,
                 abort_requires=('data-component-type="s-search-result"',),
-                max_bytes=LISTING_MAX_BYTES,
             )
             if html:
                 cards = await asyncio.to_thread(parse_listing_cards, html, resolved.domain)
@@ -180,6 +179,7 @@ async def _collect_listing(
             break
 
         page_added = 0
+        page_records: list[dict[str, Any]] = []
         for position, card in enumerate(cards, start=1):
             if _halt():
                 break
@@ -196,6 +196,7 @@ async def _collect_listing(
                 listing_page_url=url,
             )
             yielded += 1
+            page_records.append(record)
             if on_item is not None:
                 await on_item(record)
             page_added += 1
@@ -206,6 +207,8 @@ async def _collect_listing(
         if page_added == 0:
             Actor.log.info(f'Listing page {page} had no new ASINs, stopping listing.')
             break
+        if on_page is not None:
+            await on_page(page, page_records)
         more_pages = max_pages is None or page < max_pages
         if more_pages and not _halt():
             await polite_pause(0.2, 0.6)
@@ -278,16 +281,20 @@ async def _run_detail_pipeline(
     max_items: int | None,
     concurrency: int,
 ) -> tuple[int, int, int, int]:
-    """Listing produces ASINs; detail workers consume them at the same time.
+    """One listing worker fetches a page, then one detail worker per product on that page.
+
+    After that page's product pages finish, the next listing page repeats the same wave.
+    Worker count is min(products on the page, concurrency cap). Extra workers stay for later pages.
 
     Returns (stored, missed, queued, listing_pages).
     """
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=DETAIL_QUEUE_MAX)
     stop = asyncio.Event()
-    start_gate = asyncio.Semaphore(25)
+    start_gate = asyncio.Semaphore(8)
     retry_lock = asyncio.Lock()
     push_lock = asyncio.Lock()
     retries: list[dict[str, Any]] = []
+    workers: list[asyncio.Task[None]] = []
     pushed = 0
     missed = 0
     queued = 0
@@ -300,6 +307,16 @@ async def _run_detail_pipeline(
             return
         await queue.put(record)
         queued += 1
+
+    def scale_workers(needed: int) -> None:
+        target = max(1, min(needed, concurrency))
+        while len(workers) < target:
+            index = len(workers)
+            workers.append(asyncio.create_task(worker(index)))
+        Actor.log.info(
+            f'{len(workers)} detail workers for this page '
+            f'({needed} products, cap {concurrency}, sticky IP per worker).'
+        )
 
     async def worker(index: int) -> None:
         nonlocal pushed, missed, pdp_bytes
@@ -373,12 +390,21 @@ async def _run_detail_pipeline(
             pdp_bytes += sticky.bytes_downloaded
             await sticky.close()
 
-    workers = [asyncio.create_task(worker(index)) for index in range(concurrency)]
+    async def handle_page(page: int, records: list[dict[str, Any]]) -> None:
+        if stop.is_set() or not records:
+            return
+        scale_workers(len(records))
+        Actor.log.info(
+            f'Listing page {page} queued {len(records)} products; '
+            'opening that many product pages before the next listing page.'
+        )
+        for record in records:
+            await enqueue(record)
+        await queue.join()
+
     Actor.log.info(
-        f'{concurrency} detail workers ready (queue cap {DETAIL_QUEUE_MAX}, '
-        f'sticky IP per worker, rotate every {MAX_REQUESTS_PER_IP} requests or on block). '
-        'Listing continues while product pages open. '
-        'Rows are stored only when brand, About this item, or overview parsed.'
+        'One listing worker will fetch page 1, then start one detail worker per product '
+        f'on that page (cap {concurrency}). The next listing page waits until that wave finishes.'
     )
     listing_pages = 0
     listing_bytes = 0
@@ -391,7 +417,7 @@ async def _run_detail_pipeline(
                 listing_headers=listing_headers,
                 max_pages=max_pages,
                 max_items=None,
-                on_item=enqueue,
+                on_page=handle_page,
                 stop=stop,
             )
         finally:
@@ -408,6 +434,8 @@ async def _run_detail_pipeline(
         need_more = not _reached_limit(pushed, max_items)
         if retry_batch and need_more:
             pass_name = 'pass2'
+            if not workers:
+                scale_workers(min(len(retry_batch), concurrency))
             Actor.log.info(
                 f'Retrying {len(retry_batch)} products that had no brand/overview.'
             )
@@ -504,7 +532,7 @@ async def main() -> None:
             f'({pages_label}, {items_label}, '
             f'details={"on" if enrich_details else "off"}, concurrency={concurrency}, '
             f'sticky IPs rotate every {MAX_REQUESTS_PER_IP} product pages). '
-            'Listing and product-detail fetches run at the same time.'
+            'One listing worker fetches a page, then one detail worker per product on that page.'
         )
 
         proxy_configuration = await Actor.create_proxy_configuration(

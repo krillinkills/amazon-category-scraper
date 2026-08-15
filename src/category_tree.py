@@ -320,16 +320,26 @@ def listing_url(resolved: ResolvedCategory, page: int = 1, *, include_fs: bool =
 
 
 def listing_url_candidates(resolved: ResolvedCategory, page: int = 1) -> list[str]:
-    urls = [listing_url(resolved, page, include_fs=True)]
+    """Prefer search-grid URLs. /b?node= is a storefront and often has no listing cards."""
+    urls: list[str] = []
+    node = resolved.browse_node_id
+    domain = resolved.domain
+    if node:
+        urls.append(
+            f'https://{domain}/s?bbn={node}&rh=n%3A{node}&dc&page={page}'
+        )
+        if resolved.subcategory and resolved.subcategory != ALL_OPTION:
+            urls.append(
+                f'https://{domain}/s?{urlencode({"k": resolved.subcategory, "rh": f"n:{node}", "page": str(page)})}'
+            )
+    urls.append(listing_url(resolved, page, include_fs=True))
     without_fs = listing_url(resolved, page, include_fs=False)
     if without_fs not in urls:
         urls.append(without_fs)
-    node = resolved.browse_node_id
-    if node and page == 1:
-        for extra in (
-            f'https://{resolved.domain}/s?rh=n%3A{node}&fs=true&page=1',
-            f'https://{resolved.domain}/b?node={node}',
-        ):
-            if extra not in urls:
-                urls.append(extra)
-    return urls
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique

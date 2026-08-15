@@ -78,9 +78,9 @@ EMPTY_PRODUCT_DETAILS = {
 REQUEST_TIMEOUT = 18
 LOW_SPEED_LIMIT_BYTES = 2_000
 LOW_SPEED_TIME_SECONDS = 8
-PDP_MAX_BYTES = 400_000
-PDP_EXTRA_AFTER_KEEP = 100_000
-LISTING_MAX_BYTES = 220_000
+PDP_MAX_BYTES = 550_000
+PDP_EXTRA_AFTER_KEEP = 180_000
+PDP_HARD_CEILING_BYTES = 900_000
 STREAM_BLOCK_MARKERS = (
     'validateCaptcha',
     'enter the characters you see below',
@@ -167,7 +167,11 @@ def listing_fetch_debug(html: str) -> str:
         title = re.sub(r'\s+', ' ', match.group(1)).strip()[:90]
     has_search = 'data-component-type="s-search-result"' in (html or '')
     has_asin = 'data-asin="' in (html or '')
-    return f'{len(html or "")} chars, title={title!r}, search-result={has_search}, data-asin={has_asin}'
+    dp_links = len(re.findall(r'/dp/[A-Z0-9]{10}', html or '', flags=re.I))
+    return (
+        f'{len(html or "")} chars, title={title!r}, '
+        f'search-result={has_search}, data-asin={has_asin}, dp-links={dp_links}'
+    )
 
 
 def product_url(domain: str, asin: str) -> str:
@@ -306,7 +310,10 @@ class _EarlyAbortBuffer:
         ):
             self.aborted = True
             return CURL_WRITEFUNC_ERROR
-        if self.max_bytes is not None and self._size >= self.max_bytes:
+        if self._found_keep and self.max_bytes is not None and self._size >= self.max_bytes:
+            self.aborted = True
+            return CURL_WRITEFUNC_ERROR
+        if self._size >= PDP_HARD_CEILING_BYTES:
             self.aborted = True
             return CURL_WRITEFUNC_ERROR
         self._tail = haystack[-self._overlap:]
@@ -535,6 +542,38 @@ def parse_listing_cards(html: str, domain: str) -> list[dict[str, Any]]:
             'isPrime': is_prime,
             'badge': badge,
             'boughtInPastMonth': bought,
+        })
+    if items:
+        return items
+    return _cards_from_dp_hrefs(html, domain)
+
+
+_DP_ASIN = re.compile(r'/dp/([A-Z0-9]{10})(?:[/?#"\']|$)', re.I)
+
+
+def _cards_from_dp_hrefs(html: str, domain: str) -> list[dict[str, Any]]:
+    """Storefront / category-hub pages often omit data-asin but still link to /dp/."""
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _DP_ASIN.finditer(html or ''):
+        asin = match.group(1).upper()
+        if asin in seen:
+            continue
+        seen.add(asin)
+        href = match.group(0)
+        items.append({
+            'asin': asin,
+            'title': _title_from_href(href),
+            'url': product_url(domain, asin),
+            'image': None,
+            'price': None,
+            'originalPrice': None,
+            'rating': None,
+            'reviewsCount': None,
+            'isSponsored': False,
+            'isPrime': False,
+            'badge': None,
+            'boughtInPastMonth': None,
         })
     return items
 

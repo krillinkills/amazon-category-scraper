@@ -2454,10 +2454,10 @@
     "maxConcurrency": {
       "title": "Detail-page concurrency",
       "type": "integer",
-      "description": "How many product pages to fetch at once. Each worker keeps a sticky residential IP and rotates it after about 25 pages or on a block. Default 20, max 80. Higher values burn more proxy GB on Amazon.com robot checks.",
+      "description": "Maximum detail workers. The actor lists one page with a single worker, then starts one product-page worker per item on that page, up to this cap. After that wave finishes it lists the next page the same way. Default 48, max 80.",
       "minimum": 1,
       "maximum": 80,
-      "default": 20
+      "default": 48
     },
     "proxyConfiguration": {
       "title": "Proxy",
